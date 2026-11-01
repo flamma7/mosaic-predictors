@@ -8,7 +8,7 @@ world:
   env_name: swm/TwoRoom-v1
   num_envs: ${eval.num_eval}
   max_episode_steps: ??? # make sure it's >= eval_budget
-seed: 42
+seed: 49
 policy: lewm-tworoom/weights_epoch_10.pt # ckpt name or random
 
 plan_config:
