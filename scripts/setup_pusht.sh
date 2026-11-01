@@ -5,12 +5,6 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-SWM_ROOT="${ROOT}/../stable-worldmodel"
-if [[ ! -d "${SWM_ROOT}" ]]; then
-  echo "Expected stable-worldmodel at ${SWM_ROOT} (sibling of mosaic-predictors)." >&2
-  exit 1
-fi
-SWM_ROOT="$(cd "${SWM_ROOT}" && pwd)"
 STABLEWM_HOME="/workspace/.stablewm"
 export STABLEWM_HOME
 
@@ -46,12 +40,14 @@ EXCLUDES="$(mktemp)"
 trap 'rm -f "${EXCLUDES}"' EXIT
 printf '%s\n' torch torchvision > "${EXCLUDES}"
 
-# Resolve and install project deps, but leave the image torch/torchvision in place.
+# PyPI stable-worldmodel 0.1.1, not the local checkout in tool.uv.sources.
+# Leave the image torch/torchvision in place.
 uv pip install \
   --python "${PY}" \
   --break-system-packages \
+  --no-sources \
   --excludes "${EXCLUDES}" \
-  -e "${SWM_ROOT}[env,format,train]" \
+  "stable-worldmodel[env,format,train]==0.1.1" \
   "einops>=0.8.2" \
   "huggingface-hub>=2.2.0"
 
