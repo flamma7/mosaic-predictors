@@ -117,14 +117,48 @@ def get_img_preprocessor(source: str, target: str, img_size: int = 224):
     return dt.transforms.Compose(to_image, resize)
 
 
-class SaveCkptCallback(Callback):
-    """Callback to save model checkpoint after each epoch using save_pretrained."""
+CONFIG_YAML = 'config.yaml'
 
-    def __init__(self, run_name, cfg, epoch_interval: int = 1):
+
+def _hf_path_prefix(hf_cfg, run_name):
+    """Repo-relative prefix, e.g. ``mopwm/lewm/``.
+
+    ``path_prefix`` may already include ``output_model_name``. If it does
+    not, ``run_name`` is appended so the on-repo path is
+    ``{path_prefix}/{output_model_name}/``.
+    """
+    prefix = str((hf_cfg or {}).get('path_prefix') or '').strip('/')
+    name = run_name or ''
+    if name and not prefix.endswith(name):
+        prefix = f'{prefix}/{name}' if prefix else name
+    return f'{prefix}/' if prefix else ''
+
+
+class SaveCkptCallback(Callback):
+    """Save epoch weights with save_pretrained and upload them to Hugging Face."""
+
+    def __init__(
+        self,
+        run_name,
+        cfg,
+        epoch_interval: int = 1,
+        hf_cfg=None,
+        full_cfg=None,
+    ):
         super().__init__()
         self.run_name = run_name
         self.cfg = cfg
+        self.full_cfg = full_cfg
         self.epoch_interval = epoch_interval
+        self.hf_cfg = hf_cfg or {}
+        self._hf_api = None
+
+    @property
+    def _ckpt_dir(self):
+        return (
+            swm.data.utils.get_cache_dir(sub_folder='checkpoints')
+            / self.run_name
+        )
 
     def on_train_epoch_end(self, trainer, pl_module):
         super().on_train_epoch_end(trainer, pl_module)
@@ -137,13 +171,69 @@ class SaveCkptCallback(Callback):
             if (trainer.current_epoch + 1) == trainer.max_epochs:
                 self._save(pl_module.model, trainer.current_epoch + 1)
 
+    def _get_hf_api(self):
+        if self._hf_api is not None:
+            return self._hf_api
+
+        import logging
+        from huggingface_hub import HfApi
+        from huggingface_hub.utils import disable_progress_bars
+
+        disable_progress_bars()
+        logging.getLogger('huggingface_hub').setLevel(logging.ERROR)
+        token = os.environ.get('HF_TOKEN') or self.hf_cfg.get('token')
+        self._hf_api = HfApi(token=token)
+        return self._hf_api
+
+    def _upload_to_hf(self, weights_file):
+        if not self.hf_cfg.get('enabled'):
+            return
+
+        repo_id = self.hf_cfg['repo_id']
+        prefix = _hf_path_prefix(self.hf_cfg, self.run_name)
+
+        hf_api = self._get_hf_api()
+        hf_api.upload_file(
+            path_or_fileobj=str(self._ckpt_dir / weights_file),
+            path_in_repo=f'{prefix}{weights_file}',
+            repo_id=repo_id,
+            repo_type='model',
+        )
+        config_path = self._ckpt_dir / 'config.json'
+        if config_path.exists():
+            hf_api.upload_file(
+                path_or_fileobj=str(config_path),
+                path_in_repo=f'{prefix}config.json',
+                repo_id=repo_id,
+                repo_type='model',
+            )
+        print(f'Uploaded {prefix}{weights_file} to {repo_id}')
+
+    def _save_full_config(self):
+        if self.full_cfg is None:
+            return None
+        self._ckpt_dir.mkdir(parents=True, exist_ok=True)
+        path = self._ckpt_dir / CONFIG_YAML
+        OmegaConf.save(
+            OmegaConf.create(
+                OmegaConf.to_container(self.full_cfg, resolve=True)
+            ),
+            path,
+        )
+        return CONFIG_YAML
+
     def _save(self, model, epoch):
+        filename = f'weights_epoch_{epoch}.pt'
         save_pretrained(
             model,
             run_name=self.run_name,
             config=self.cfg,
-            filename=f'weights_epoch_{epoch}.pt',
+            filename=filename,
         )
+        self._save_full_config()
+        self._upload_to_hf(filename)
+        if (self._ckpt_dir / CONFIG_YAML).exists():
+            self._upload_to_hf(CONFIG_YAML)
 
 
 class _SigregDiagClose(Callback):
@@ -295,10 +385,16 @@ def run(cfg):
     with open(run_dir / 'config.yaml', 'w') as f:
         OmegaConf.save(cfg, f)
 
+    hf_cfg = cfg.get('hf')
+    if hf_cfg is not None:
+        hf_cfg = OmegaConf.to_container(hf_cfg, resolve=True)
+
     save_ckpt_callback = SaveCkptCallback(
         run_name=cfg.output_model_name,
         cfg=cfg.model,
         epoch_interval=1,
+        hf_cfg=hf_cfg,
+        full_cfg=cfg,
     )
     callbacks = [save_ckpt_callback]
     if getattr(world_model, 'sigreg_diagnostics', None) is not None:

@@ -16,3 +16,10 @@ wandb:
     id: ${subdir}
     resume: allow
     log_model: False
+
+# Uploads weights_epoch_*.pt, config.json, and config.yaml to an existing
+# HF model repo. Auth: HF_TOKEN env var, or `huggingface-cli login`.
+hf:
+  enabled: true
+  repo_id: flamma77/mosaic_predictors
+  path_prefix: ${output_model_name}
