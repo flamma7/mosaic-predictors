@@ -1,12 +1,12 @@
 defaults:
   - _self_
   - launcher: local
-  - data: tworoom
+  - data: pusht
 
 output_model_name: lewm
 subdir: ${hydra:job.id}
 
-num_workers: 2
+num_workers: 8
 train_split: 0.9
 seed: 3072
 img_size: 224
@@ -22,21 +22,21 @@ trainer:
   max_epochs: 10
   devices: auto
   accelerator: gpu
-  precision: 16-mixed #bf16
+  precision: bf16 #16-mixed
   gradient_clip_val: 1.0
 
 loader:
-  batch_size: 32
+  batch_size: 128
   num_workers: ${num_workers}
   drop_last: True
   persistent_workers: True
-  prefetch_factor: 2
+  prefetch_factor: 3
   pin_memory: True
   shuffle: True
 
 optimizer:
   type: AdamW
-  lr: 2.5e-5
+  lr: 128
   weight_decay: 1e-3
 
 wm:
