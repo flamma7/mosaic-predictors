@@ -36,7 +36,7 @@ loader:
 
 optimizer:
   type: AdamW
-  lr: 128
+  lr: 5e-5
   weight_decay: 1e-3
 
 wm:
