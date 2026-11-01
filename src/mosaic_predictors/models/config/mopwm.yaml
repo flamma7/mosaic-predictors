@@ -3,7 +3,7 @@ defaults:
   - launcher: local
   - data: tworoom
 
-output_model_name: mosaic-lewm
+output_model_name: mopwm-tworoom
 subdir: ${hydra:job.id}
 
 num_workers: 2
@@ -22,11 +22,11 @@ trainer:
   max_epochs: 10
   devices: auto
   accelerator: gpu
-  precision: 16-mixed #bf16
+  precision: bf16
   gradient_clip_val: 1.0
 
 loader:
-  batch_size: 32
+  batch_size: 128
   num_workers: ${num_workers}
   drop_last: True
   persistent_workers: True
@@ -36,7 +36,7 @@ loader:
 
 optimizer:
   type: AdamW
-  lr: 2.5e-5
+  lr: 5.0e-5
   weight_decay: 1e-3
 
 wm:
