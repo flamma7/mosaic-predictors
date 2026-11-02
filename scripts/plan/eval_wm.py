@@ -1,4 +1,4 @@
-"""Script to evaluate a World Model using MPC on a dataset of episodes."""
+"""Evaluate a world model with MPC on a dataset of episodes."""
 
 import os
 
@@ -63,9 +63,9 @@ def get_dataset(cfg, dataset_name):
     return dataset
 
 
-@hydra.main(version_base=None, config_path='./config', config_name='pusht')
+@hydra.main(version_base=None, config_path='./config', config_name='tworoom')
 def run(cfg: DictConfig):
-    """Run evaluation of dinowm vs random policy."""
+    """Plan with a world-model checkpoint, or a random policy."""
     assert (
         cfg.plan_config.horizon * cfg.plan_config.action_block
         <= cfg.eval.eval_budget
@@ -107,6 +107,13 @@ def run(cfg: DictConfig):
 
     if policy != 'random':
         model = swm.wm.utils.load_pretrained(cfg.policy)
+        # Eval knob. None keeps every completed pair. Ignored by models
+        # that do not take a memory cap.
+        if hasattr(model, 'max_memory') and 'max_memory' in cfg:
+            max_memory = cfg.get('max_memory')
+            model.max_memory = (
+                None if max_memory is None else int(max_memory)
+            )
         if cfg.get('bf16', False):
             model = model.to(torch.bfloat16)
         model = model.to('cuda')
