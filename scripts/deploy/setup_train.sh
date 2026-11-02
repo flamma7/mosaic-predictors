@@ -1,8 +1,18 @@
 #!/usr/bin/env bash
-# Bootstrap a RunPod image for LeWM PushT training.
+# Bootstrap a RunPod image for MoPWM training.
+# Usage: setup_pusht.sh [pusht|tworoom]
 # Torch and CUDA are already in the image Python; this script does not replace them.
 # HF_TOKEN must already be set. Training is not started; the command is printed.
 set -euo pipefail
+
+TASK="${1:-pusht}"
+case "${TASK}" in
+  pusht|tworoom) ;;
+  *)
+    echo "Usage: $0 [pusht|tworoom]" >&2
+    exit 1
+    ;;
+esac
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 STABLEWM_HOME="/workspace/.stablewm"
@@ -78,16 +88,38 @@ if [[ -z "${HF_BIN}" ]]; then
   exit 1
 fi
 
-echo "Downloading PushT to ${DATASET_DIR}/pusht_expert_train.lance"
-if [[ -d "${DATASET_DIR}/pusht_expert_train.lance" ]] && [[ -n "$(ls -A "${DATASET_DIR}/pusht_expert_train.lance")" ]]; then
-  echo "Already present: ${DATASET_DIR}/pusht_expert_train.lance"
+if [[ "${TASK}" == pusht ]]; then
+  DATASET_PATH="${DATASET_DIR}/pusht_expert_train.lance"
+  echo "Downloading PushT to ${DATASET_PATH}"
+  if [[ -d "${DATASET_PATH}" ]] && [[ -n "$(ls -A "${DATASET_PATH}")" ]]; then
+    echo "Already present: ${DATASET_PATH}"
+  else
+    "${HF_BIN}" download galilai-group/lewm-pusht pusht_expert_train.lance/ \
+      --repo-type dataset \
+      --local-dir "${DATASET_DIR}" \
+      --token "${HF_TOKEN}"
+  fi
+  RUN_NAME=mopwm-pusht4
 else
-  "${HF_BIN}" download galilai-group/lewm-pusht pusht_expert_train.lance/ \
-    --repo-type dataset \
-    --local-dir "${DATASET_DIR}" \
-    --token "${HF_TOKEN}"
+  DATASET_PATH="${DATASET_DIR}/tworoom.h5"
+  echo "Downloading TwoRoom to ${DATASET_PATH}"
+  if [[ -f "${DATASET_PATH}" ]]; then
+    echo "Already present: ${DATASET_PATH}"
+  else
+    if ! command -v zstd >/dev/null 2>&1; then
+      echo "zstd is required to unpack tworoom.tar.zst." >&2
+      exit 1
+    fi
+    "${HF_BIN}" download quentinll/lewm-tworooms tworoom.tar.zst \
+      --repo-type dataset \
+      --local-dir "${DATASET_DIR}" \
+      --token "${HF_TOKEN}"
+    tar --zstd -xf "${DATASET_DIR}/tworoom.tar.zst" -C "${DATASET_DIR}"
+    rm -f "${DATASET_DIR}/tworoom.tar.zst"
+  fi
+  RUN_NAME=mopwm-tworoom
 fi
 
 echo
 echo "Start training with:"
-echo "STABLEWM_HOME=${STABLEWM_HOME} ${PY} ${ROOT}/scripts/train/mopwm.py data=pusht output_model_name=mopwm-pusht4"
+echo "STABLEWM_HOME=${STABLEWM_HOME} ${PY} ${ROOT}/scripts/train/mopwm.py data=${TASK} output_model_name=${RUN_NAME}"
