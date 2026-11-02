@@ -10,7 +10,8 @@ never reads its own unfinished value: callers pass a bank that contains
 only pairs whose values are already known, and this module slices that
 bank to the first n entries for each query.
 
-One bank per block. No short/long split, no eviction, no positional encoding.
+One bank per block. No short/long split, no positional encoding. A cache
+max_len keeps each query to the newest pairs and the block drops the rest.
 """
 
 from __future__ import annotations
@@ -18,7 +19,7 @@ from __future__ import annotations
 import torch
 from torch import nn
 
-from mosaic_predictors.models.mosaics.bandwidth import AdaptiveBandwidth
+from mosaic_predictors.bandwidth import AdaptiveBandwidth
 
 
 class AssociativeMemory(nn.Module):
@@ -36,13 +37,15 @@ class AssociativeMemory(nn.Module):
         bank_keys: torch.Tensor,
         bank_values: torch.Tensor,
         n0: int,
+        max_len: int | None = None,
     ) -> torch.Tensor:
         """Read the bank.
 
         query: (B, T, H, d) keys of the new tokens.
         bank_*: (B, M, H, d) completed pairs visible to this chunk.
         n0: how many of those pairs the first new query may read.
-        Query-local index t reads exactly the first n0 + t pairs.
+        Query-local index t reads the first n0 + t pairs, or the newest
+        max_len of them when that cap is set.
         The bank length must be n0 + T - 1 (every pair the last query can
         read, and nothing beyond it).
         """
@@ -75,7 +78,13 @@ class AssociativeMemory(nn.Module):
 
         # Pairs visible at each query. Training counts are [0, 1, 2]:
         # z0 sees nothing, z1 sees pair 0, z2 sees both pairs.
-        counts = n0 + torch.arange(length, device=query.device)
+        # A cap replaces that count with the newest max_len pairs, and the
+        # bandwidth uses the shortened count.
+        causal = n0 + torch.arange(length, device=query.device)
+        if max_len is None:
+            counts = causal
+        else:
+            counts = causal.clamp(max=max_len)
         # Per-head temperature beta(n) = b1 * n^alpha + b0, shape (T, H, 1).
         # A larger count sharpens the softmax over the longer bank.
         beta = self.bandwidth(counts)
@@ -88,15 +97,19 @@ class AssociativeMemory(nn.Module):
             # Training: step 0 -> 0 pairs, step 1 -> 1, step 2 -> 2.
             # A later rollout step arrives with n0>0 and T=1, so this is
             # just n0 and the single query reads the whole bank.
-            count = n0 + step
-            if count == 0:
+            # With max_len, a query that would see 3 pairs instead reads the
+            # newest 2: keys[:, start:end], not the prefix.
+            end = n0 + step
+            keep = end if max_len is None else min(end, max_len)
+            start = end - keep
+            if keep == 0:
                 # z0's prediction has no memory yet.
                 outputs.append(query_f.new_zeros(batch, heads, dim_head))
                 continue
-            # Query key against the first `count` stored keys.
-            # (B, H, d) x (B, count, H, d) -> (B, H, count), one score per pair.
+            # Query key against the stored keys this step may read.
+            # (B, H, d) x (B, keep, H, d) -> (B, H, keep), one score per pair.
             dots = torch.einsum(
-                'bhd,bmhd->bhm', query_f[:, step], keys_f[:, :count]
+                'bhd,bmhd->bhm', query_f[:, step], keys_f[:, start:end]
             )
             # beta[step] is (H, 1); broadcast over batch and the pair axis.
             scale = beta[step].view(1, heads, 1)
@@ -104,8 +117,10 @@ class AssociativeMemory(nn.Module):
             # the weight is 1 and the read returns psi(z1). At step 2 the
             # query key(z2, a2) mixes psi(z1) and psi(z2).
             attn = torch.softmax(dots * scale, dim=-1)
-            # (B, H, count) x (B, count, H, d) -> (B, H, d).
-            outputs.append(torch.einsum('bhm,bmhd->bhd', attn, values_f[:, :count]))
+            # (B, H, keep) x (B, keep, H, d) -> (B, H, d).
+            outputs.append(
+                torch.einsum('bhm,bmhd->bhd', attn, values_f[:, start:end])
+            )
         # Stack the per-frame reads back into (B, T, H, d) and restore dtype.
         mixed = torch.stack(outputs, dim=1).to(dtype=query.dtype)
         # Merge heads, then project to the residual width (B, T, hidden_dim).

@@ -8,27 +8,27 @@ Run from the repo root:
 from __future__ import annotations
 
 import math
+import sys
 import unittest
 from pathlib import Path
 
 import torch
 from torch import nn
 
-from mosaic_predictors.models.mosaics.bandwidth import AdaptiveBandwidth
-from mosaic_predictors.models.mosaics.gated_keys import GatedKeyExtractor
-from mosaic_predictors.models.mosaics.memory import AssociativeMemory
-from mosaic_predictors.models.mosaics.predictor import MosaicsPredictor
-from mosaic_predictors.models.mosaics.values import NextStateValues
-from mosaic_predictors.models.mopwm import MoPWM
+from mosaic_predictors.bandwidth import AdaptiveBandwidth
+from mosaic_predictors.gated_keys import GatedKeyExtractor
+from mosaic_predictors.memory import AssociativeMemory
+from mosaic_predictors.predictor import MosaicsPredictor
+from mosaic_predictors.values import NextStateValues
+
+TRAIN_DIR = Path(__file__).resolve().parents[1] / 'scripts' / 'train'
+if str(TRAIN_DIR) not in sys.path:
+    sys.path.insert(0, str(TRAIN_DIR))
+
+from mopwm import MoPWM
 
 
-CONFIG_DIR = (
-    Path(__file__).resolve().parents[1]
-    / 'src'
-    / 'mosaic_predictors'
-    / 'models'
-    / 'config'
-)
+CONFIG_DIR = TRAIN_DIR / 'config'
 
 
 def activate(predictor: MosaicsPredictor, std: float = 0.05) -> None:
@@ -354,6 +354,12 @@ class RetrievalTest(unittest.TestCase):
         empty = memory(query[:, :1], bank_k[:, :0], bank_v[:, :0], n0=0)
         torch.testing.assert_close(empty, torch.zeros_like(empty))
 
+        # A cap of 1 drops the older pair, so the last query reads v1.
+        capped = memory(query, bank_k, bank_v, n0=0, max_len=1)
+        torch.testing.assert_close(capped[:, 0], torch.zeros(1, 4))
+        torch.testing.assert_close(capped[:, 1], v0.view(1, 4), atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(capped[:, 2], v1.view(1, 4), atol=1e-5, rtol=1e-5)
+
 
 class PredictorBehaviorTest(unittest.TestCase):
     def test_future_does_not_change_earlier_predictions(self):
@@ -505,6 +511,53 @@ class CacheParityTest(unittest.TestCase):
         torch.testing.assert_close(reset_out, fresh, atol=1e-5, rtol=1e-5)
         self.assertFalse(torch.allclose(continued, reset_out))
 
+    def test_max_len_drops_oldest_pairs(self):
+        """Length 3 with max_len 2 keeps the newest two pairs."""
+        torch.manual_seed(0)
+        predictor = small_predictor(depth=1)
+        x = torch.randn(2, 5, 32)
+        a = torch.randn(2, 5, 32)
+        full = predictor.init_cache(2, device=x.device, dtype=x.dtype)
+        cap = predictor.init_cache(2, max_len=2, device=x.device, dtype=x.dtype)
+        for t in range(x.shape[1]):
+            _, full = predictor.step(x[:, t], a[:, t], full)
+            _, cap = predictor.step(x[:, t], a[:, t], cap)
+            self.assertLessEqual(cap.completed, 2)
+        self.assertEqual(full.completed, 4)
+        self.assertEqual(cap.completed, 2)
+        torch.testing.assert_close(cap.blocks[0].keys, full.blocks[0].keys[:, -2:])
+        torch.testing.assert_close(
+            cap.blocks[0].values, full.blocks[0].values[:, -2:]
+        )
+        self.assertEqual(predictor.init_cache(1, max_len=100).max_len, 100)
+        with self.assertRaises(ValueError):
+            predictor.init_cache(1, max_len=-1)
+
+    def test_capped_prefill_matches_steps(self):
+        torch.manual_seed(0)
+        predictor = small_predictor()
+        x = torch.randn(2, 7, 32)
+        a = torch.randn(2, 7, 32)
+        cache = predictor.init_cache(2, max_len=2, device=x.device, dtype=x.dtype)
+        window, cache = predictor.prefill(x, a, cache)
+        self.assertEqual(cache.completed, 2)
+
+        stepped_cache = predictor.init_cache(
+            2, max_len=2, device=x.device, dtype=x.dtype
+        )
+        pieces = []
+        for t in range(x.shape[1]):
+            piece, stepped_cache = predictor.step(x[:, t], a[:, t], stepped_cache)
+            pieces.append(piece)
+            self.assertLessEqual(stepped_cache.completed, 2)
+        torch.testing.assert_close(
+            window, torch.stack(pieces, dim=1), atol=1e-5, rtol=1e-5
+        )
+        for block, stepped in zip(cache.blocks, stepped_cache.blocks):
+            torch.testing.assert_close(block.keys, stepped.keys)
+            torch.testing.assert_close(block.values, stepped.values)
+            torch.testing.assert_close(block.pending_key, stepped.pending_key)
+
 
 class TrainingIntegrationTest(unittest.TestCase):
     def test_encode_predict_and_losses(self):
@@ -618,6 +671,61 @@ class PlanningTest(unittest.TestCase):
         expected = torch.stack(frames, dim=1).reshape(batch, samples, hist + horizon, dim)
         torch.testing.assert_close(out, expected, atol=1e-5, rtol=1e-5)
         torch.testing.assert_close(out[:, :, :hist], emb)
+
+    def test_rollout_max_memory_fifo(self):
+        torch.manual_seed(0)
+        model = toy_world()
+        model.eval()
+        batch, samples, hist, horizon, dim, action_dim = 2, 2, 3, 6, 16, 3
+        emb = torch.randn(batch, samples, hist, dim)
+        past = torch.randn(batch, samples, hist - 1, action_dim)
+        candidates = torch.randn(batch, samples, horizon, action_dim)
+        pixels = torch.randn(batch, samples, hist, 3, 8, 8)
+
+        def call(max_memory=None, model_cap=None):
+            model.max_memory = model_cap
+            info = {
+                'pixels': pixels.clone(),
+                'emb': emb.clone(),
+                'action_history': past.clone(),
+            }
+            kwargs = {} if max_memory is None else {'max_memory': max_memory}
+            return model.rollout(info, candidates.clone(), **kwargs)['predicted_emb']
+
+        full = call()
+        wide = call(max_memory=100)
+        capped = call(max_memory=2)
+        from_attr = call(model_cap=2)
+        torch.testing.assert_close(wide, full)
+        torch.testing.assert_close(from_attr, capped)
+        self.assertFalse(torch.allclose(capped, full))
+        torch.testing.assert_close(capped[:, :, :hist], emb)
+        self.assertEqual(tuple(capped.shape), (batch, samples, hist + horizon, dim))
+
+        flat_emb = emb.reshape(batch * samples, hist, dim)
+        flat_act = torch.cat([past, candidates], dim=2).reshape(
+            batch * samples, hist - 1 + horizon, action_dim
+        )
+        all_act = model.action_encoder(flat_act)
+        cache = model.predictor.init_cache(
+            batch * samples, max_len=2, device=flat_emb.device, dtype=flat_emb.dtype
+        )
+        ctx, cache = model.predictor.prefill(flat_emb, all_act[:, :hist], cache)
+        frames = list(flat_emb.unbind(dim=1))
+        frames.append(ctx[:, -1])
+        self.assertLessEqual(cache.completed, 2)
+        for t in range(1, horizon):
+            nxt, cache = model.predictor.step(
+                frames[-1], all_act[:, hist + t - 1], cache
+            )
+            frames.append(nxt)
+            self.assertLessEqual(cache.completed, 2)
+        expected = torch.stack(frames, dim=1).reshape(
+            batch, samples, hist + horizon, dim
+        )
+        torch.testing.assert_close(capped, expected, atol=1e-5, rtol=1e-5)
+        with self.assertRaises(ValueError):
+            call(max_memory=-1)
 
     def test_candidates_are_independent_and_repeatable(self):
         torch.manual_seed(0)

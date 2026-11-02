@@ -25,6 +25,8 @@ class BlockCache:
     keys: torch.Tensor
     values: torch.Tensor
     pending_key: torch.Tensor | None = None
+    # Completed pairs kept per candidate. None keeps every pair.
+    max_len: int | None = None
 
     @property
     def completed(self) -> int:
@@ -52,6 +54,7 @@ def empty_block_cache(
     dim_head: int,
     device: torch.device | str,
     dtype: torch.dtype,
+    max_len: int | None = None,
 ) -> BlockCache:
     recurrent = torch.zeros(
         batch_size, heads, dim_head, device=device, dtype=torch.float32
@@ -62,7 +65,13 @@ def empty_block_cache(
     values = torch.zeros(
         batch_size, 0, heads, dim_head, device=device, dtype=dtype
     )
-    return BlockCache(recurrent=recurrent, keys=keys, values=values, pending_key=None)
+    return BlockCache(
+        recurrent=recurrent,
+        keys=keys,
+        values=values,
+        pending_key=None,
+        max_len=max_len,
+    )
 
 
 def init_cache(
@@ -76,11 +85,16 @@ def init_cache(
 ) -> PredictorCache:
     """Fresh window: zero recurrent state and no completed pairs.
 
-    max_len is recorded for the caller. Storage grows by concatenation, so
-    candidates never share a writable buffer.
+    max_len is the most completed pairs a candidate retains. Past that,
+    the oldest pairs are dropped. None keeps every pair. Each candidate
+    has its own storage.
     """
+    if max_len is not None and max_len < 0:
+        raise ValueError(f'max_len must be non-negative, got {max_len}')
     blocks = [
-        empty_block_cache(batch_size, heads, dim_head, device, dtype)
+        empty_block_cache(
+            batch_size, heads, dim_head, device, dtype, max_len=max_len
+        )
         for _ in range(n_blocks)
     ]
     return PredictorCache(

@@ -17,7 +17,7 @@ from stable_worldmodel.wm.lewm.lewm import LeWM
 from stable_worldmodel.wm.loss import SIGReg
 from lightning.pytorch.callbacks import Callback
 from stable_worldmodel.wm.utils import save_pretrained
-from mosaic_predictors.models.sigreg_diagnostics import SIGRegCollapseMonitor
+from sigreg_diagnostics import SIGRegCollapseMonitor
 
 
 class MoPWM(LeWM):
@@ -26,10 +26,19 @@ class MoPWM(LeWM):
     encode() and predict() are the LeWM implementations: the same encoder,
     action encoder, projectors, and tensor layout. rollout() keeps LeWM's
     context/candidate action pairing and writes predicted_emb the same way.
-    Hypothetical futures use a per-candidate cache, so the full causal
-    history of that rollout stays readable. history_size is accepted because
-    planners pass it; memory is not truncated to that window.
+    Hypothetical futures use a per-candidate cache. max_memory is how many
+    completed pairs that cache keeps; older pairs are dropped once the
+    length would pass it. None keeps the full causal history. history_size
+    is accepted because planners pass it; it does not set the cap.
     """
+
+    def __init__(self, *args, max_memory: int | None = None, **kwargs):
+        super().__init__(*args, **kwargs)
+        if max_memory is not None and max_memory < 0:
+            raise ValueError(
+                f'max_memory must be non-negative, got {max_memory}'
+            )
+        self.max_memory = max_memory
 
     def _project_pred(self, preds: torch.Tensor) -> torch.Tensor:
         """Apply pred_proj the way LeWM.predict does, without a second predictor call."""
@@ -41,12 +50,25 @@ class MoPWM(LeWM):
         out = rearrange(flat, '(b t) d -> b t d', b=batch)
         return out[:, 0] if single else out
 
-    def rollout(self, info, action_sequence, history_size: int = None):
+    def rollout(
+        self,
+        info,
+        action_sequence,
+        history_size: int = None,
+        max_memory: int | None = None,
+    ):
         if history_size is None:
             history_size = getattr(self.predictor, 'num_frames', 3)
-        # Retained for the LeWM call signature. The cache keeps every
-        # completed pair instead of sliding a window of this length.
+        # LeWM planners pass history_size. The mosaic cap is max_memory:
+        # completed (key, value) pairs kept per candidate. The argument
+        # overrides the model attribute. None on both keeps every pair.
         _ = history_size
+        if max_memory is None:
+            max_memory = getattr(self, 'max_memory', None)
+        if max_memory is not None and max_memory < 0:
+            raise ValueError(
+                f'max_memory must be non-negative, got {max_memory}'
+            )
 
         assert 'pixels' in info, 'pixels not in info_dict'
         horizon_ctx = info['pixels'].size(2)
@@ -85,7 +107,7 @@ class MoPWM(LeWM):
         flat = batch * samples
         cache = self.predictor.init_cache(
             flat,
-            max_len=horizon_ctx + steps,
+            max_len=max_memory,
             device=emb_init.device,
             dtype=emb_init.dtype,
         )

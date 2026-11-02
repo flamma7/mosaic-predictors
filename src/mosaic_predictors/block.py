@@ -28,11 +28,11 @@ from __future__ import annotations
 import torch
 from torch import nn
 
-from mosaic_predictors.models.mosaics.cache import BlockCache, empty_block_cache
-from mosaic_predictors.models.mosaics.gated_keys import GatedKeyExtractor
-from mosaic_predictors.models.mosaics.memory import AssociativeMemory
-from mosaic_predictors.models.mosaics.swiglu import SwiGLU
-from mosaic_predictors.models.mosaics.values import NextStateValues
+from mosaic_predictors.cache import BlockCache, empty_block_cache
+from mosaic_predictors.gated_keys import GatedKeyExtractor
+from mosaic_predictors.memory import AssociativeMemory
+from mosaic_predictors.swiglu import SwiGLU
+from mosaic_predictors.values import NextStateValues
 
 
 def modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
@@ -125,7 +125,15 @@ class MemoryBlock(nn.Module):
         # part of the value. A later block's incoming residual already
         # includes earlier blocks' update at that same index.
         bank_k, bank_v, n0 = self._bank(keys, h, cache)
-        memory_out = self.memory(keys, bank_k, bank_v, n0)
+        memory_out = self.memory(
+            keys, bank_k, bank_v, n0, max_len=cache.max_len
+        )
+        # The read above already ignored pairs older than max_len. Drop them
+        # from the stored bank too, so the next step never sees them.
+        # contiguous() releases the dropped prefix instead of viewing it.
+        if cache.max_len is not None and bank_k.shape[1] > cache.max_len:
+            bank_k = bank_k[:, -cache.max_len :].contiguous()
+            bank_v = bank_v[:, -cache.max_len :].contiguous()
 
         h = h + self.resid_drop(memory_out)
         shift_mlp, scale_mlp, gate_mlp = self.swiglu_modulation(action).chunk(3, dim=-1)
@@ -137,5 +145,6 @@ class MemoryBlock(nn.Module):
             keys=bank_k,
             values=bank_v,
             pending_key=keys[:, -1],
+            max_len=cache.max_len,
         )
         return h, updated

@@ -8,7 +8,9 @@ Drop-in shape for LeWM's Predictor.forward(x, c):
 No positional embedding. The residual width stays `hidden_dim`; heads of
 `dim_head` are an internal projection. Training calls forward without a
 cache (one window, empty memory). Rollouts call init_cache / prefill / step
-/ reset_cache. Cached steps match a full-window forward when dropout is off.
+/ reset_cache. Cached steps match a full-window forward when dropout is off
+and the cache has no max_len. A max_len keeps that many completed pairs and
+drops older ones.
 """
 
 from __future__ import annotations
@@ -16,8 +18,8 @@ from __future__ import annotations
 import torch
 from torch import nn
 
-from mosaic_predictors.models.mosaics.block import MemoryBlock
-from mosaic_predictors.models.mosaics.cache import (
+from mosaic_predictors.block import MemoryBlock
+from mosaic_predictors.cache import (
     PredictorCache,
     init_cache,
     reset_cache,
@@ -122,7 +124,11 @@ class MosaicsPredictor(nn.Module):
         device: torch.device | str | None = None,
         dtype: torch.dtype | None = None,
     ) -> PredictorCache:
-        """Independent empty memory for each of batch_size candidates."""
+        """Independent empty memory for each of batch_size candidates.
+
+        max_len is how many completed pairs each candidate keeps. None keeps
+        every pair.
+        """
         param = next(self.parameters())
         if device is None:
             device = param.device
