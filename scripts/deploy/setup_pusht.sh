@@ -4,7 +4,7 @@
 # HF_TOKEN must already be set. Training is not started; the command is printed.
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 STABLEWM_HOME="/workspace/.stablewm"
 export STABLEWM_HOME
 
@@ -82,8 +82,3 @@ else
     --local-dir "${DATASET_DIR}" \
     --token "${HF_TOKEN}"
 fi
-
-TRAIN="${ROOT}/src/mosaic_predictors/transformer_based/train/lewm.py"
-echo
-echo "Start training with:"
-echo "STABLEWM_HOME=${STABLEWM_HOME} ${PY} ${TRAIN} data=pusht"
