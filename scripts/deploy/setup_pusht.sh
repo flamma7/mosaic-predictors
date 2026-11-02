@@ -87,3 +87,7 @@ else
     --local-dir "${DATASET_DIR}" \
     --token "${HF_TOKEN}"
 fi
+
+echo
+echo "Start training with:"
+echo "STABLEWM_HOME=${STABLEWM_HOME} ${PY} ${ROOT}/scripts/train/mopwm.py data=pusht output_model_name=mopwm-pusht4"
