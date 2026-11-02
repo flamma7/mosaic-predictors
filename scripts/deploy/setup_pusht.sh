@@ -40,11 +40,15 @@ EXCLUDES="$(mktemp)"
 trap 'rm -f "${EXCLUDES}"' EXIT
 printf '%s\n' torch torchvision > "${EXCLUDES}"
 
-# PyPI stable-worldmodel 0.1.1, not the local checkout in tool.uv.sources.
+# PyPI stable-worldmodel 0.1.1. This repo's pyproject.toml and uv.lock point
+# that package at ../stable-worldmodel, which is the desktop checkout and is
+# not on RunPod. --directory and --no-config keep uv from reading them.
 # Leave the image torch/torchvision in place.
 uv pip install \
+  --directory /tmp \
   --python "${PY}" \
   --break-system-packages \
+  --no-config \
   --no-sources \
   --excludes "${EXCLUDES}" \
   "stable-worldmodel[env,format,train]==0.1.1" \
@@ -55,6 +59,7 @@ uv pip install \
   --python "${PY}" \
   --break-system-packages \
   --no-deps \
+  --no-sources \
   -e "${ROOT}"
 
 DATASET_DIR="${STABLEWM_HOME}/datasets"
