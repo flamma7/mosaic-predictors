@@ -6,7 +6,7 @@ defaults:
 output_model_name: mopwm-tworoom
 subdir: ${hydra:job.id}
 
-num_workers: 6
+num_workers: 8
 train_split: 0.9
 seed: 3072
 img_size: 224
@@ -26,7 +26,7 @@ trainer:
   gradient_clip_val: 1.0
 
 loader:
-  batch_size: 192
+  batch_size: 128
   num_workers: ${num_workers}
   drop_last: True
   persistent_workers: True
@@ -45,7 +45,7 @@ val_loader:
 
 optimizer:
   type: AdamW
-  lr: 6.12e-5
+  lr: 5e-5
   weight_decay: 1e-3
 
 wm:
