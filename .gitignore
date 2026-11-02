@@ -221,3 +221,5 @@ __marimo__/
 
 outputs/
 wandb/
+*.txt
+wandb_resume.json
