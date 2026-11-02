@@ -19,6 +19,7 @@ from mosaic_predictors.gated_keys import GatedKeyExtractor
 from mosaic_predictors.memory import AssociativeMemory
 from mosaic_predictors.mopwm import MoPWM
 from mosaic_predictors.predictor import MosaicsPredictor
+from mosaic_predictors.swiglu import swiglu_width
 from mosaic_predictors.values import NextStateValues
 
 TRAIN_DIR = Path(__file__).resolve().parents[1] / 'scripts' / 'train'
@@ -180,6 +181,34 @@ class ArchitectureTest(unittest.TestCase):
         block0 = predictor.blocks[0]
         self.assertEqual(block0.swiglu.w_out.weight.grad.abs().sum().item(), 0.0)
         self.assertGreater(block0.swiglu_modulation[-1].weight.grad.abs().sum(), 0)
+
+    def test_swiglu_multiple_of_shrinks_width(self):
+        self.assertEqual(swiglu_width(2048), 2048)
+        self.assertEqual(swiglu_width(2048, None), 2048)
+        self.assertEqual(swiglu_width(2048, 256), 1536)
+        with self.assertRaises(ValueError):
+            swiglu_width(2048, 0)
+
+        predictor = MosaicsPredictor(
+            num_frames=3,
+            depth=2,
+            heads=4,
+            mlp_dim=2048,
+            input_dim=32,
+            hidden_dim=32,
+            output_dim=32,
+            dim_head=8,
+            swiglu_multiple_of=256,
+        )
+        self.assertEqual(predictor.mlp_dim, 2048)
+        self.assertEqual(predictor.swiglu_multiple_of, 256)
+        for block in predictor.blocks:
+            self.assertEqual(block.mlp_dim, 2048)
+            self.assertEqual(block.swiglu.hidden_dim, 1536)
+            self.assertEqual(block.swiglu.w_gate.out_features, 1536)
+            self.assertEqual(block.swiglu.w_up.out_features, 1536)
+            self.assertEqual(block.swiglu.w_out.in_features, 1536)
+            self.assertEqual(block.swiglu.w_out.out_features, 32)
 
     def test_rejects_other_memory_designs(self):
         with self.assertRaises(ValueError):
@@ -844,10 +873,34 @@ class HydraTest(unittest.TestCase):
         self.assertEqual(predictor.heads, 16)
         self.assertEqual(predictor.dim_head, 64)
         self.assertEqual(predictor.mlp_dim, 2048)
+        self.assertIsNone(predictor.swiglu_multiple_of)
+        self.assertEqual(predictor.blocks[0].swiglu.hidden_dim, 2048)
         self.assertEqual(predictor.hidden_dim, 192)
         self.assertEqual(predictor.num_frames, 3)
         self.assertEqual(predictor.dropout_p, 0.1)
         self.assertEqual(predictor.emb_dropout, 0.0)
+
+    def test_config_swiglu_multiple_of_override(self):
+        from hydra import compose, initialize_config_dir
+        from hydra.core.global_hydra import GlobalHydra
+        from hydra.utils import instantiate
+
+        GlobalHydra.instance().clear()
+        try:
+            with initialize_config_dir(
+                config_dir=str(CONFIG_DIR), version_base=None
+            ):
+                cfg = compose(
+                    config_name='mopwm',
+                    overrides=['model.predictor.swiglu_multiple_of=256'],
+                )
+            predictor = instantiate(cfg.model.predictor)
+        finally:
+            GlobalHydra.instance().clear()
+
+        self.assertEqual(predictor.mlp_dim, 2048)
+        self.assertEqual(predictor.swiglu_multiple_of, 256)
+        self.assertEqual(predictor.blocks[0].swiglu.hidden_dim, 1536)
 
 
 if __name__ == '__main__':

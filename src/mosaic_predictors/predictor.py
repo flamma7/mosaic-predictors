@@ -46,6 +46,7 @@ class MosaicsPredictor(nn.Module):
         value_interpolation: bool = False,
         memory_type: str = 'full_window',
         adaptive_bandwidth: bool = True,
+        swiglu_multiple_of: int | None = None,
     ) -> None:
         super().__init__()
         self._check_config(
@@ -67,6 +68,7 @@ class MosaicsPredictor(nn.Module):
         self.output_dim = output_dim or input_dim
         self.dropout_p = dropout
         self.emb_dropout = emb_dropout
+        self.swiglu_multiple_of = swiglu_multiple_of
 
         self.dropout = nn.Dropout(emb_dropout)
         self.input_proj = (
@@ -81,7 +83,14 @@ class MosaicsPredictor(nn.Module):
         )
         self.blocks = nn.ModuleList(
             [
-                MemoryBlock(hidden_dim, heads, dim_head, mlp_dim, dropout)
+                MemoryBlock(
+                    hidden_dim,
+                    heads,
+                    dim_head,
+                    mlp_dim,
+                    dropout,
+                    swiglu_multiple_of=swiglu_multiple_of,
+                )
                 for _ in range(depth)
             ]
         )

@@ -73,6 +73,9 @@ model:
     depth: 6
     heads: 16
     mlp_dim: 2048
+    # null: SwiGLU width is mlp_dim. A positive int applies
+    # round_up(int(2 * mlp_dim / 3), this), so 256 turns 2048 into 1536.
+    swiglu_multiple_of: 256
     dim_head: 64
     dropout: 0.1
     emb_dropout: 0.0
