@@ -114,7 +114,7 @@ else
       --repo-type dataset \
       --local-dir "${DATASET_DIR}" \
       --token "${HF_TOKEN}"
-    tar --zstd -xf "${DATASET_DIR}/tworoom.tar.zst" -C "${DATASET_DIR}"
+    tar --zstd --no-same-owner -xf "${DATASET_DIR}/tworoom.tar.zst" -C "${DATASET_DIR}"
     rm -f "${DATASET_DIR}/tworoom.tar.zst"
   fi
   RUN_NAME=mopwm-tworoom
