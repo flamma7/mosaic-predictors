@@ -53,7 +53,7 @@ wm:
   num_preds: 1
 
 model:
-  _target_: mopwm.MoPWM
+  _target_: mosaic_predictors.mopwm.MoPWM
   # Completed pairs kept per candidate during rollout. null keeps them all.
   # 2 retains memories from the previous 2 states, then drops the oldest.
   max_memory: null

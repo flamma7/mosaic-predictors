@@ -1,4 +1,4 @@
-"""Script to evaluate a World Model using MPC on a dataset of episodes."""
+"""Evaluate MoPWM with MPC on a dataset of episodes."""
 
 import os
 
@@ -15,6 +15,7 @@ from omegaconf import DictConfig, OmegaConf
 from sklearn import preprocessing
 from torchvision.transforms import v2 as transforms
 import stable_worldmodel as swm
+from mosaic_predictors.mopwm import MoPWM
 
 
 def img_transform(cfg, dtype=torch.float32):
@@ -63,9 +64,9 @@ def get_dataset(cfg, dataset_name):
     return dataset
 
 
-@hydra.main(version_base=None, config_path='./config', config_name='pusht')
+@hydra.main(version_base=None, config_path='./config', config_name='tworoom')
 def run(cfg: DictConfig):
-    """Run evaluation of dinowm vs random policy."""
+    """Plan with a MoPWM checkpoint, or a random policy."""
     assert (
         cfg.plan_config.horizon * cfg.plan_config.action_block
         <= cfg.eval.eval_budget
@@ -106,7 +107,19 @@ def run(cfg: DictConfig):
     policy = cfg.get('policy', 'random')
 
     if policy != 'random':
-        model = swm.wm.utils.load_pretrained(cfg.policy)
+        # null keeps every completed pair. An int is the per-candidate cap
+        # MoPWM.rollout reads from the model when the planner omits it.
+        max_memory = cfg.get('max_memory', None)
+        if max_memory is not None:
+            max_memory = int(max_memory)
+        model = swm.wm.utils.load_pretrained(
+            cfg.policy, extra_args={'max_memory': max_memory}
+        )
+        if not isinstance(model, MoPWM):
+            raise TypeError(
+                'checkpoint config must instantiate '
+                f'mosaic_predictors.mopwm.MoPWM, got {type(model).__name__}'
+            )
         if cfg.get('bf16', False):
             model = model.to(torch.bfloat16)
         model = model.to('cuda')

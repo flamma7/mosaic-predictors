@@ -8,7 +8,6 @@ Run from the repo root:
 from __future__ import annotations
 
 import math
-import sys
 import unittest
 from pathlib import Path
 
@@ -18,14 +17,11 @@ from torch import nn
 from mosaic_predictors.bandwidth import AdaptiveBandwidth
 from mosaic_predictors.gated_keys import GatedKeyExtractor
 from mosaic_predictors.memory import AssociativeMemory
+from mosaic_predictors.mopwm import MoPWM
 from mosaic_predictors.predictor import MosaicsPredictor
 from mosaic_predictors.values import NextStateValues
 
 TRAIN_DIR = Path(__file__).resolve().parents[1] / 'scripts' / 'train'
-if str(TRAIN_DIR) not in sys.path:
-    sys.path.insert(0, str(TRAIN_DIR))
-
-from mopwm import MoPWM
 
 
 CONFIG_DIR = TRAIN_DIR / 'config'
