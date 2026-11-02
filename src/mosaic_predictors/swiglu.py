@@ -4,8 +4,8 @@ SwiGLU(x) = W_out (SiLU(W_gate x) * W_up x).
 
 Pre-normalization, action-conditioned AdaLN, and the residual dropout live
 in the memory block. That AdaLN emits shift, scale, and a residual gate.
-With swiglu_multiple_of unset, mlp_dim is the hidden width. Set it to a
-positive int and the width becomes round_up(int(2 * mlp_dim / 3), that).
+swiglu_scale_hidden false keeps hidden_dim as the SwiGLU width. True applies
+round_up(int(2 * hidden_dim / 3), 256), so 2048 becomes 1536.
 """
 
 from __future__ import annotations
@@ -14,30 +14,24 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+# Round-up multiple used when swiglu_scale_hidden is true.
+_SWIGLU_MULTIPLE_OF = 256
 
-def swiglu_width(hidden_dim: int, multiple_of: int | None = None) -> int:
+
+def swiglu_width(hidden_dim: int, scale_hidden: bool = False) -> int:
     """Hidden width of the three SwiGLU matrices.
 
-    ``multiple_of`` unset keeps ``hidden_dim``. A positive int applies the
-    usual shrink, ``int(2 * hidden_dim / 3)``, then rounds up to that
-    multiple. 2048 with 256 is 1536.
+    ``scale_hidden`` false keeps ``hidden_dim``. True applies
+    ``int(2 * hidden_dim / 3)`` and rounds up to 256. 2048 becomes 1536.
     """
-    if multiple_of is None:
+    if not scale_hidden:
         return hidden_dim
-    if (
-        isinstance(multiple_of, bool)
-        or not isinstance(multiple_of, int)
-        or multiple_of < 1
-    ):
-        raise ValueError(
-            f'swiglu_multiple_of must be a positive int or null, got {multiple_of!r}'
-        )
+    multiple_of = _SWIGLU_MULTIPLE_OF
     shrunk = int(2 * hidden_dim / 3)
     width = multiple_of * ((shrunk + multiple_of - 1) // multiple_of)
     if width < 1:
         raise ValueError(
-            f'SwiGLU width for mlp_dim={hidden_dim} and '
-            f'swiglu_multiple_of={multiple_of} is {width}'
+            f'SwiGLU width for hidden_dim={hidden_dim} with scaling is {width}'
         )
     return width
 
@@ -47,11 +41,11 @@ class SwiGLU(nn.Module):
         self,
         dim: int,
         hidden_dim: int,
-        multiple_of: int | None = None,
+        scale_hidden: bool = False,
     ) -> None:
         super().__init__()
         self.dim = dim
-        self.hidden_dim = swiglu_width(hidden_dim, multiple_of)
+        self.hidden_dim = swiglu_width(hidden_dim, scale_hidden)
         self.w_gate = nn.Linear(dim, self.hidden_dim, bias=False)
         self.w_up = nn.Linear(dim, self.hidden_dim, bias=False)
         self.w_out = nn.Linear(self.hidden_dim, dim, bias=False)

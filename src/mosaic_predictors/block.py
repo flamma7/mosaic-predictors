@@ -48,14 +48,14 @@ class MemoryBlock(nn.Module):
         dim_head: int,
         mlp_dim: int,
         dropout: float,
-        swiglu_multiple_of: int | None = None,
+        swiglu_scale_hidden: bool = False,
     ) -> None:
         super().__init__()
         self.dim = dim
         self.heads = heads
         self.dim_head = dim_head
         self.mlp_dim = mlp_dim
-        self.swiglu_multiple_of = swiglu_multiple_of
+        self.swiglu_scale_hidden = swiglu_scale_hidden
 
         self.key_norm = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
         self.adaLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(dim, 2 * dim))
@@ -70,7 +70,7 @@ class MemoryBlock(nn.Module):
         self.swiglu_modulation = nn.Sequential(nn.SiLU(), nn.Linear(dim, 3 * dim))
         nn.init.constant_(self.swiglu_modulation[-1].weight, 0)
         nn.init.constant_(self.swiglu_modulation[-1].bias, 0)
-        self.swiglu = SwiGLU(dim, mlp_dim, multiple_of=swiglu_multiple_of)
+        self.swiglu = SwiGLU(dim, mlp_dim, scale_hidden=swiglu_scale_hidden)
         self.resid_drop = nn.Dropout(dropout)
 
     def _empty_cache(self, batch: int, device: torch.device, dtype: torch.dtype) -> BlockCache:

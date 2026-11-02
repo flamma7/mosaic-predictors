@@ -182,12 +182,9 @@ class ArchitectureTest(unittest.TestCase):
         self.assertEqual(block0.swiglu.w_out.weight.grad.abs().sum().item(), 0.0)
         self.assertGreater(block0.swiglu_modulation[-1].weight.grad.abs().sum(), 0)
 
-    def test_swiglu_multiple_of_shrinks_width(self):
-        self.assertEqual(swiglu_width(2048), 2048)
-        self.assertEqual(swiglu_width(2048, None), 2048)
-        self.assertEqual(swiglu_width(2048, 256), 1536)
-        with self.assertRaises(ValueError):
-            swiglu_width(2048, 0)
+    def test_swiglu_scale_hidden(self):
+        self.assertEqual(swiglu_width(2048, False), 2048)
+        self.assertEqual(swiglu_width(2048, True), 1536)
 
         predictor = MosaicsPredictor(
             num_frames=3,
@@ -198,10 +195,10 @@ class ArchitectureTest(unittest.TestCase):
             hidden_dim=32,
             output_dim=32,
             dim_head=8,
-            swiglu_multiple_of=256,
+            swiglu_scale_hidden=True,
         )
         self.assertEqual(predictor.mlp_dim, 2048)
-        self.assertEqual(predictor.swiglu_multiple_of, 256)
+        self.assertTrue(predictor.swiglu_scale_hidden)
         for block in predictor.blocks:
             self.assertEqual(block.mlp_dim, 2048)
             self.assertEqual(block.swiglu.hidden_dim, 1536)
@@ -873,14 +870,14 @@ class HydraTest(unittest.TestCase):
         self.assertEqual(predictor.heads, 16)
         self.assertEqual(predictor.dim_head, 64)
         self.assertEqual(predictor.mlp_dim, 2048)
-        self.assertIsNone(predictor.swiglu_multiple_of)
-        self.assertEqual(predictor.blocks[0].swiglu.hidden_dim, 2048)
+        self.assertTrue(predictor.swiglu_scale_hidden)
+        self.assertEqual(predictor.blocks[0].swiglu.hidden_dim, 1536)
         self.assertEqual(predictor.hidden_dim, 192)
         self.assertEqual(predictor.num_frames, 3)
         self.assertEqual(predictor.dropout_p, 0.1)
         self.assertEqual(predictor.emb_dropout, 0.0)
 
-    def test_config_swiglu_multiple_of_override(self):
+    def test_config_swiglu_scale_hidden_off(self):
         from hydra import compose, initialize_config_dir
         from hydra.core.global_hydra import GlobalHydra
         from hydra.utils import instantiate
@@ -892,15 +889,15 @@ class HydraTest(unittest.TestCase):
             ):
                 cfg = compose(
                     config_name='mopwm',
-                    overrides=['model.predictor.swiglu_multiple_of=256'],
+                    overrides=['model.predictor.swiglu_scale_hidden=false'],
                 )
             predictor = instantiate(cfg.model.predictor)
         finally:
             GlobalHydra.instance().clear()
 
         self.assertEqual(predictor.mlp_dim, 2048)
-        self.assertEqual(predictor.swiglu_multiple_of, 256)
-        self.assertEqual(predictor.blocks[0].swiglu.hidden_dim, 1536)
+        self.assertFalse(predictor.swiglu_scale_hidden)
+        self.assertEqual(predictor.blocks[0].swiglu.hidden_dim, 2048)
 
 
 if __name__ == '__main__':
