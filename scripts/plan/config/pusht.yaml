@@ -21,7 +21,7 @@ policy: random # ckpt name or random
 
 # Completed pairs kept per candidate during rollout. null keeps them all.
 # 2 retains memories from the previous 2 states, then drops the oldest.
-max_memory: 2
+max_memory: null
 
 plan_config:
   horizon: 5
@@ -38,7 +38,7 @@ eval:
   goal_offset_steps: 25
   eval_budget: 50
   img_size: 224
-  dataset_name: pusht_expert_train.h5
+  dataset_name: pusht_expert_train.lance
   callables:
     # -- set state
     - method: _set_state
@@ -52,7 +52,9 @@ eval:
           value: goal_state
 
 compile: false
-bf16: false
+bf16: true
+# null skips eval mp4s. World.evaluate records only when video is a directory.
+video: false
 
 output:
   filename: pusht_results.txt

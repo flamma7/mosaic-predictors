@@ -190,10 +190,15 @@ def run(cfg: DictConfig):
     world.set_policy(policy)
 
     results_path.mkdir(parents=True, exist_ok=True)
-    print(
-        f'[eval] saving videos to {results_path.resolve()} '
-        '(one env_{i}.mp4 per env)'
-    )
+    # null/false skips mp4s. World.evaluate records only when video is a directory.
+    video_dir = results_path if cfg.get('video', True) else None
+    if video_dir is None:
+        print('[eval] skipping videos')
+    else:
+        print(
+            f'[eval] saving videos to {video_dir.resolve()} '
+            '(one env_{i}.mp4 per env)'
+        )
 
     autocast_ctx = torch.autocast(
         device_type='cuda',
@@ -219,7 +224,7 @@ def run(cfg: DictConfig):
                 callables=OmegaConf.to_container(
                     cfg.eval.get('callables'), resolve=True
                 ),
-                video=results_path,
+                video=video_dir,
             )
         print('Warmup done.')
 
@@ -234,12 +239,13 @@ def run(cfg: DictConfig):
             callables=OmegaConf.to_container(
                 cfg.eval.get('callables'), resolve=True
             ),
-            video=results_path,
+            video=video_dir,
         )
     end_time = time.time()
 
     print(metrics)
-    print(f'[eval] videos saved to {results_path.resolve()}')
+    if video_dir is not None:
+        print(f'[eval] videos saved to {video_dir.resolve()}')
 
     results_path = results_path / cfg.output.filename
     results_path.parent.mkdir(parents=True, exist_ok=True)
