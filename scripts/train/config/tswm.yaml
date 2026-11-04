@@ -1,0 +1,89 @@
+defaults:
+  - _self_
+  - launcher: local
+  - data: pusht
+
+output_model_name: tswm
+subdir: ${hydra:job.id}
+
+num_workers: 8
+train_split: 0.9
+seed: 3072
+img_size: 224
+# Pooled width of the visual encoder. 2048 is microsoft/resnet-50.
+# A ViT encoder uses its hidden size here, and interpolate_pos_encoding: true.
+backbone_dim: 2048
+embed_dim: 384
+
+trainer:
+  max_epochs: 10
+  devices: auto
+  accelerator: gpu
+  precision: bf16
+  gradient_clip_val: 1.0
+
+loader:
+  batch_size: 128
+  num_workers: ${num_workers}
+  drop_last: True
+  persistent_workers: True
+  prefetch_factor: 3
+  pin_memory: True
+  shuffle: True
+
+optimizer:
+  type: AdamW
+  lr: 5e-5
+  weight_decay: 1e-3
+
+wm:
+  history_size: 3
+  num_preds: 1
+
+model:
+  _target_: transformer_predictors.tswm.TSWM
+  # Detach the prediction target. The encoder still learns through the
+  # context branch and through the curvature term.
+  stop_grad: true
+  interpolate_pos_encoding: false
+  encoder:
+    _target_: stable_worldmodel.wm.prejepa.module.create_backbone
+    name: resnet_50
+  predictor:
+    _target_: stable_worldmodel.wm.lewm.module.Predictor
+    num_frames: ${wm.history_size}
+    input_dim: ${embed_dim}
+    hidden_dim: ${embed_dim}
+    output_dim: ${embed_dim}
+    depth: 6
+    heads: 16
+    mlp_dim: 2048
+    dim_head: 64
+    dropout: 0.1
+    emb_dropout: 0.0
+  action_encoder:
+    _target_: stable_worldmodel.wm.lewm.module.Embedder
+    input_dim: ???
+    emb_dim: ${embed_dim}
+  projector:
+    _target_: stable_worldmodel.wm.lewm.module.MLP
+    input_dim: ${backbone_dim}
+    output_dim: ${embed_dim}
+    hidden_dim: 2048
+    norm_fn:
+      _target_: torch.nn.BatchNorm1d
+      _partial_: true
+  pred_proj:
+    _target_: stable_worldmodel.wm.lewm.module.MLP
+    input_dim: ${embed_dim}
+    output_dim: ${embed_dim}
+    hidden_dim: 2048
+    norm_fn:
+      _target_: torch.nn.BatchNorm1d
+      _partial_: true
+
+loss:
+  curvature:
+    # SWM TemporalStraighteningLoss is mean negative cosine similarity.
+    # Its gradient matches the paper's 1 - cos. 0 disables the term.
+    weight: 0.1

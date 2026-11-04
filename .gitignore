@@ -218,3 +218,8 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+outputs/
+wandb/
+*.txt
+wandb_resume.json
