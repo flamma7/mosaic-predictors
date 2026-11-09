@@ -98,8 +98,9 @@ printf '%s\n' torch torchvision > "${EXCLUDES}"
 # during the stable-worldmodel install. Leave the image
 # torch/torchvision in place. [format] is the Lance dataset. [train] is
 # transformers (DINOv2), stable-pretraining, and Lightning. pygame, pymunk,
-# and opencv are the PushT pieces of the env extra. The rest of that extra
-# is gymnasium[all], which builds box2d-py from source and needs swig.
+# shapely, and opencv are the PushT pieces of the env extra. PushT imports
+# shapely from envs/utils.py. The rest of that extra is gymnasium[all],
+# which builds box2d-py from source and needs swig.
 # scikit-learn is imported by the MPC eval and is otherwise only a
 # transitive dependency.
 uv pip install \
@@ -115,7 +116,8 @@ uv pip install \
   "opencv-python-headless" \
   "pygame" \
   "pymunk" \
-  "scikit-learn"
+  "scikit-learn" \
+  "shapely"
 
 uv pip install \
   --directory /tmp \
