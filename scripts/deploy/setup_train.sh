@@ -96,10 +96,12 @@ printf '%s\n' torch torchvision > "${EXCLUDES}"
 
 # --directory and --no-config keep uv from reading this repo's pyproject
 # during the stable-worldmodel install. Leave the image
-# torch/torchvision in place. [env] is pygame, pymunk, and opencv for PushT
-# MPC. [format] is the Lance dataset. [train] is transformers (DINOv2),
-# stable-pretraining, and Lightning. scikit-learn is imported by the MPC
-# eval and is otherwise only a transitive dependency.
+# torch/torchvision in place. [format] is the Lance dataset. [train] is
+# transformers (DINOv2), stable-pretraining, and Lightning. pygame, pymunk,
+# and opencv are the PushT pieces of the env extra. The rest of that extra
+# is gymnasium[all], which builds box2d-py from source and needs swig.
+# scikit-learn is imported by the MPC eval and is otherwise only a
+# transitive dependency.
 uv pip install \
   --directory /tmp \
   --python "${PY}" \
@@ -107,9 +109,12 @@ uv pip install \
   --no-config \
   --no-sources \
   --excludes "${EXCLUDES}" \
-  -e "${SWM_SRC}[env,format,train]" \
+  -e "${SWM_SRC}[format,train]" \
   "einops>=0.8.2" \
   "huggingface-hub>=2.2.0" \
+  "opencv-python-headless" \
+  "pygame" \
+  "pymunk" \
   "scikit-learn"
 
 uv pip install \
@@ -209,6 +214,7 @@ fi
 
 ENV_PREFIX="SDL_VIDEODRIVER=dummy HF_HOME=${HF_HOME} STABLEWM_HOME=${STABLEWM_HOME}"
 echo
+echo "Use this interpreter. uv run creates .venv and reinstalls the lockfile, including another torch."
 if [[ "${TASK}" == pusht ]]; then
   echo "Start DINO-WM training with:"
   echo "${ENV_PREFIX} ${PY} ${ROOT}/scripts/train/dinowm.py data=pusht output_model_name=dinowm-pusht"

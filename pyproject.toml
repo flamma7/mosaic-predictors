@@ -11,7 +11,10 @@ dependencies = [
     # "anygoal",
     "einops>=0.8.2",
     "huggingface-hub>=2.2.0",
-    "stable-worldmodel[env,format,train]",
+    "opencv-python-headless",
+    "pygame",
+    "pymunk",
+    "stable-worldmodel[format,train]",
     "torch>=2.14.1",
     "torchvision>=0.29.1",
 ]
