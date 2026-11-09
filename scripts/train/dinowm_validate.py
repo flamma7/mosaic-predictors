@@ -296,15 +296,25 @@ def _subsample(windows, num_samples, seed):
     return [windows[int(i)] for i in pick]
 
 
-def _report(trainer, metrics):
+def _report(pl_module, metrics):
+    """Log through Lightning so these share the validation step record.
+
+    A direct ``logger.log_metrics`` call writes a second Wandb record at the
+    same ``trainer/global_step``. Wandb keeps one record per step, and the
+    later ``validate/*`` flush replaces it.
+    """
     for key, value in metrics.items():
         print(f'[validate_extra] {key}: {value:.6f}')
-    logger = getattr(trainer, 'logger', None)
-    if logger is None or not hasattr(logger, 'log_metrics'):
+    if not metrics:
         return
-    logger.log_metrics(
+    pl_module.log_dict(
         {key: float(value) for key, value in metrics.items()},
-        step=trainer.global_step,
+        logger=True,
+        on_step=False,
+        on_epoch=True,
+        add_dataloader_idx=False,
+        rank_zero_only=True,
+        batch_size=1,
     )
 
 
@@ -440,18 +450,18 @@ class ExtraValidationCallback(Callback):
         print(f'[validate_extra] epoch {trainer.current_epoch + 1}: {names}')
         try:
             if self.mse_enabled and self.windows:
-                self._run_mse(trainer, model)
+                self._run_mse(pl_module, model)
             elif self.mse_enabled:
                 print('[validate_extra] no validation clip fits the rollout')
             if self.mpc_enabled:
-                self._run_mpc(trainer, pl_module, model)
+                self._run_mpc(pl_module, model)
         finally:
             pl_module.model = model
             if hasattr(model, '_init_cached_info'):
                 del model._init_cached_info
             model.train(was_training)
 
-    def _run_mse(self, trainer, model):
+    def _run_mse(self, pl_module, model):
         device = next(model.parameters()).device
         use_autocast = self.bf16 and device.type == 'cuda'
         previous = self.dataset.transform
@@ -520,9 +530,9 @@ class ExtraValidationCallback(Callback):
                     )
         finally:
             self.dataset.transform = previous
-        _report(trainer, metrics)
+        _report(pl_module, metrics)
 
-    def _run_mpc(self, trainer, pl_module, model):
+    def _run_mpc(self, pl_module, model):
         if self._mpc_ready is None:
             self._mpc_ready = self._prepare_mpc(model)
         ready = self._mpc_ready
@@ -534,7 +544,7 @@ class ExtraValidationCallback(Callback):
             )
             rate = self._mpc_one(pl_module, model, spec, ready)
             metrics[f'validate_mpc/{name}'] = rate
-        _report(trainer, metrics)
+        _report(pl_module, metrics)
 
     def _prepare_mpc(self, model):
         mpc = self.cfg.validate_extra.mpc
