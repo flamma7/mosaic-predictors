@@ -8,7 +8,7 @@ authors = [
 ]
 requires-python = ">=3.10"
 dependencies = [
-    "anygoal",
+    # "anygoal",
     "einops>=0.8.2",
     "huggingface-hub>=2.2.0",
     "stable-worldmodel[env,format,train]",
@@ -31,4 +31,4 @@ module-name = ["mosaic_predictors", "transformer_predictors"]
 
 [tool.uv.sources]
 stable-worldmodel = { path = "../stable-worldmodel", editable = true }
-anygoal = { path = "../AnyGoal", editable = true }
+# anygoal = { path = "../AnyGoal", editable = true }

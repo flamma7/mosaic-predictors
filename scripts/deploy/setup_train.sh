@@ -91,22 +91,7 @@ if [[ "${synced}" -eq 0 ]]; then
 fi
 
 EXCLUDES="$(mktemp)"
-PYPROJECT_BACKUP=""
-LOCK_BACKUP=""
-restore_setup_files() {
-  if [[ -n "${PYPROJECT_BACKUP}" && -f "${PYPROJECT_BACKUP}" ]]; then
-    mv -f "${PYPROJECT_BACKUP}" "${ROOT}/pyproject.toml"
-    PYPROJECT_BACKUP=""
-  fi
-  if [[ -n "${LOCK_BACKUP}" && -f "${LOCK_BACKUP}" ]]; then
-    mv -f "${LOCK_BACKUP}" "${ROOT}/uv.lock"
-    LOCK_BACKUP=""
-  fi
-  if [[ -n "${EXCLUDES}" ]]; then
-    rm -f "${EXCLUDES}"
-  fi
-}
-trap restore_setup_files EXIT
+trap 'rm -f "${EXCLUDES}"' EXIT
 printf '%s\n' torch torchvision > "${EXCLUDES}"
 
 # --directory and --no-config keep uv from reading this repo's pyproject
@@ -127,32 +112,6 @@ uv pip install \
   "huggingface-hub>=2.2.0" \
   "scikit-learn"
 
-# uv.lock pins anygoal at ../AnyGoal. That checkout is only on the desktop,
-# and this training run does not import it. Hide the lock and drop the
-# dependency so this install cannot resolve it. Both files are put back
-# before the script continues, and again on exit if the install fails.
-# The desktop project is unchanged: this script is not how that copy is installed.
-PYPROJECT_BACKUP="$(mktemp)"
-cp "${ROOT}/pyproject.toml" "${PYPROJECT_BACKUP}"
-if [[ -f "${ROOT}/uv.lock" ]]; then
-  LOCK_BACKUP="$(mktemp)"
-  mv "${ROOT}/uv.lock" "${LOCK_BACKUP}"
-fi
-ROOT="${ROOT}" "${PY}" - <<'PY'
-import os
-from pathlib import Path
-
-path = Path(os.environ["ROOT"]) / "pyproject.toml"
-kept = []
-for line in path.read_text().splitlines(keepends=True):
-    stripped = line.strip()
-    if stripped in ('"anygoal",', "'anygoal',"):
-        continue
-    if stripped.startswith("anygoal = "):
-        continue
-    kept.append(line)
-path.write_text("".join(kept))
-PY
 uv pip install \
   --directory /tmp \
   --python "${PY}" \
@@ -161,7 +120,6 @@ uv pip install \
   --no-deps \
   --no-sources \
   -e "${ROOT}"
-restore_setup_files
 
 SDL_VIDEODRIVER=dummy "${PY}" - <<'PY'
 import os
