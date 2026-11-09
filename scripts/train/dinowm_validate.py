@@ -479,7 +479,7 @@ class ExtraValidationCallback(Callback):
                     self.seed,
                 )
                 batch_size = min(
-                    int(self.cfg.loader.batch_size), len(windows)
+                    int(self.cfg.val_loader.batch_size), len(windows)
                 )
                 loader = torch.utils.data.DataLoader(
                     windows,
