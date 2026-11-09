@@ -50,7 +50,7 @@ eval:
           value: goal_pos_agent
 
 # null skips eval mp4s. World.evaluate records only when video is a directory.
-video: true
+video: false
 
 output:
   filename: tworoom_results.txt

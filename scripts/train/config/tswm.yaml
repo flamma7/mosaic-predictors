@@ -10,10 +10,10 @@ num_workers: 8
 train_split: 0.9
 seed: 3072
 img_size: 224
-# Pooled width of the visual encoder. 2048 is microsoft/resnet-50.
-# A ViT encoder uses its hidden size here, and interpolate_pos_encoding: true.
-backbone_dim: 2048
+# Global visual token after the scratch ResNet projection.
 embed_dim: 384
+# Action token concatenated onto the visual token before the causal ViT.
+action_emb_dim: 10
 
 trainer:
   max_epochs: 10
@@ -47,40 +47,25 @@ model:
   stop_grad: true
   interpolate_pos_encoding: false
   encoder:
-    _target_: stable_worldmodel.wm.prejepa.module.create_backbone
-    name: resnet_50
+    _target_: transformer_predictors.tswm.SmallResNetGeM
+    dim: ${embed_dim}
+    gem_p: 3.0
   predictor:
-    _target_: stable_worldmodel.wm.lewm.module.Predictor
+    _target_: stable_worldmodel.wm.prejepa.module.CausalPredictor
+    num_patches: 1
     num_frames: ${wm.history_size}
-    input_dim: ${embed_dim}
-    hidden_dim: ${embed_dim}
-    output_dim: ${embed_dim}
+    dim: ${eval:'${embed_dim} + ${action_emb_dim}'}
     depth: 6
     heads: 16
     mlp_dim: 2048
     dim_head: 64
     dropout: 0.1
     emb_dropout: 0.0
+    pool: mean
   action_encoder:
-    _target_: stable_worldmodel.wm.lewm.module.Embedder
+    _target_: transformer_predictors.tswm.ActionEncoder
     input_dim: ???
-    emb_dim: ${embed_dim}
-  projector:
-    _target_: stable_worldmodel.wm.lewm.module.MLP
-    input_dim: ${backbone_dim}
-    output_dim: ${embed_dim}
-    hidden_dim: 2048
-    norm_fn:
-      _target_: torch.nn.BatchNorm1d
-      _partial_: true
-  pred_proj:
-    _target_: stable_worldmodel.wm.lewm.module.MLP
-    input_dim: ${embed_dim}
-    output_dim: ${embed_dim}
-    hidden_dim: 2048
-    norm_fn:
-      _target_: torch.nn.BatchNorm1d
-      _partial_: true
+    emb_dim: ${action_emb_dim}
 
 loss:
   curvature:

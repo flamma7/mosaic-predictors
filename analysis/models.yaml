@@ -1,0 +1,9 @@
+seed: 42
+num_envs: 150
+models:
+  - lewm-pusht
+  - lewm-pusht3
+  - mopwm-pusht-big2
+  - mopwm-pusht
+  - mopwm-pusht4
+  - mopwm-pusht5

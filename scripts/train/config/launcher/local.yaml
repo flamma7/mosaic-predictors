@@ -11,7 +11,7 @@ wandb:
   enabled: true
   config:
     entity: flamma7-myself
-    project: mosaic-tmp
+    project: jepa-perturb
     name: ${output_model_name}
     id: ${subdir}
     resume: allow

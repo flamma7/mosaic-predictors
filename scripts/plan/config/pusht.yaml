@@ -58,3 +58,26 @@ video: false
 
 output:
   filename: pusht_results.txt
+  # null writes next to the checkpoint. A path collects results and videos.
+  directory: null
+
+# AdaJEPA visual shifts. Each flag is independent and off by default.
+# Image corruptions run on the live observation, the initial frame, and the
+# goal image. Colors are PushT variation values; the initial frame and the
+# goal are re-rendered with those colors before any image corruption.
+#
+#   visual.blur=true                 Gaussian σ=2.0, kernel 13×13
+#   visual.blur=3.0                  same kernel rule at another σ
+#   visual.salt_pepper=true          snp1, density 0.01 salt and 0.01 pepper
+#   visual.salt_pepper=0.05          snp5
+#   visual.dark=true                 multiply pixels by 0.5
+#   visual.agent_color=red           blue agent -> pygame Red (255, 0, 0)
+#   visual.block_color=red           light-gray T -> (255, 0, 0)
+#   visual.anchor_color=red          light-green anchor -> (255, 0, 0)
+visual:
+  blur: false
+  salt_pepper: false
+  dark: false
+  agent_color: null
+  block_color: null
+  anchor_color: null

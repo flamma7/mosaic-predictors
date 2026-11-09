@@ -1,4 +1,4 @@
-"""Encoder pooling, stop-grad, and LeWM rollout shape for TSWM."""
+"""Scratch ResNet, causal ViT predictor, and stop-grad for TSWM."""
 
 from __future__ import annotations
 
@@ -7,103 +7,108 @@ import unittest
 import torch
 from torch import nn
 
-from transformer_predictors.tswm import TSWM, temporal_straightening_losses
-from stable_worldmodel.wm.lewm.module import Embedder, Predictor
 from stable_worldmodel.wm.loss import TemporalStraighteningLoss
+from stable_worldmodel.wm.prejepa.module import CausalPredictor
+from transformer_predictors.tswm import (
+    ActionEncoder,
+    SmallResNetGeM,
+    TSWM,
+    temporal_straightening_losses,
+)
 
 
-class _Logits:
-    def __init__(self, logits: torch.Tensor) -> None:
-        self.logits = logits
-
-
-class _Hidden:
-    def __init__(self, hidden: torch.Tensor) -> None:
-        self.last_hidden_state = hidden
-
-
-class TinyResNet(nn.Module):
-    def __init__(self, dim: int, pixels: int = 3 * 8 * 8) -> None:
-        super().__init__()
-        self.lin = nn.Linear(pixels, dim)
-
-    def forward(self, pixels):
-        flat = pixels.reshape(pixels.shape[0], -1).to(self.lin.weight.dtype)
-        return _Logits(self.lin(flat))
-
-
-class TinyViT(nn.Module):
-    def __init__(self, dim: int, pixels: int = 3 * 8 * 8) -> None:
-        super().__init__()
-        self.lin = nn.Linear(pixels, dim)
-
-    def forward(self, pixels, interpolate_pos_encoding=False):
-        if not interpolate_pos_encoding:
-            raise AssertionError('ViT encode should request pos interpolation')
-        flat = pixels.reshape(pixels.shape[0], -1).to(self.lin.weight.dtype)
-        tokens = self.lin(flat).unsqueeze(1)
-        pad = torch.zeros(
-            tokens.shape[0], 2, tokens.shape[-1], device=tokens.device
-        )
-        return _Hidden(torch.cat([tokens, pad], dim=1))
-
-
-def toy_world(encoder, dim=16, action_dim=4) -> TSWM:
-    predictor = Predictor(
+def toy_world(dim=16, action_dim=4, action_emb=4) -> TSWM:
+    predictor = CausalPredictor(
+        num_patches=1,
         num_frames=3,
+        dim=dim + action_emb,
         depth=2,
         heads=4,
         mlp_dim=32,
-        input_dim=dim,
-        hidden_dim=dim,
-        output_dim=dim,
         dim_head=8,
         dropout=0.0,
         emb_dropout=0.0,
+        pool='mean',
     )
     model = TSWM(
-        encoder=encoder,
+        encoder=SmallResNetGeM(dim=dim, gem_p=3.0),
         predictor=predictor,
-        action_encoder=Embedder(
-            input_dim=action_dim, smoothed_dim=action_dim, emb_dim=dim
-        ),
+        action_encoder=ActionEncoder(input_dim=action_dim, emb_dim=action_emb),
         projector=nn.Identity(),
         pred_proj=nn.Identity(),
         stop_grad=True,
-        interpolate_pos_encoding=isinstance(encoder, TinyViT),
     )
     model.eval()
     return model
 
 
-class EncodeTest(unittest.TestCase):
-    def test_resnet_logits_and_predict_shapes(self):
-        model = toy_world(TinyResNet(16))
-        pixels = torch.randn(2, 4, 3, 8, 8)
+class EncoderTest(unittest.TestCase):
+    def test_matches_scratch_global_resnet(self):
+        net = SmallResNetGeM(dim=384, gem_p=3.0)
+        blocks = [net.rb1, net.rb2, net.rb3, net.rb4, net.rb5]
+        channels = [(3, 32), (32, 64), (64, 128), (128, 256), (256, 512)]
+        self.assertEqual(
+            [(block.input_dim, block.output_dim) for block in blocks],
+            channels,
+        )
+        self.assertTrue(all(block.resample == 'down' for block in blocks))
+        self.assertAlmostEqual(net.gem.p.detach().item(), 3.0)
+        projection = list(net.projection)
+        self.assertIsInstance(projection[0], nn.Linear)
+        self.assertEqual(projection[0].in_features, 512)
+        self.assertEqual(projection[0].out_features, 384)
+        self.assertIsInstance(projection[1], nn.GELU)
+        self.assertIsInstance(projection[2], nn.Linear)
+        self.assertEqual(
+            (projection[2].in_features, projection[2].out_features), (384, 384)
+        )
+        self.assertIsInstance(projection[3], nn.LayerNorm)
+        image = torch.randn(2, 3, 32, 32)
+        self.assertEqual(tuple(net(image).shape), (2, 1, 384))
+
+    def test_predictor_matches_causal_vit(self):
+        # temporal-straightening conf/predictor/vit.yaml, global token,
+        # plus the 10-d action embedding concatenated on the feature axis.
+        predictor = CausalPredictor(
+            num_patches=1,
+            num_frames=3,
+            dim=384 + 10,
+            depth=6,
+            heads=16,
+            mlp_dim=2048,
+            dim_head=64,
+            dropout=0.1,
+            emb_dropout=0.0,
+            pool='mean',
+        )
+        self.assertEqual(tuple(predictor.pos_embedding.shape), (1, 3, 394))
+        self.assertEqual(predictor.dropout.p, 0.0)
+        self.assertEqual(len(predictor.transformer.layers), 6)
+        attention, feedforward = predictor.transformer.layers[0]
+        self.assertEqual(attention.heads, 16)
+        self.assertEqual(attention.to_qkv.out_features, 16 * 64 * 3)
+        self.assertEqual(attention.dropout.p, 0.1)
+        self.assertEqual(feedforward.net[1].out_features, 2048)
+        self.assertIsInstance(feedforward.net[2], nn.GELU)
+        self.assertEqual(feedforward.net[3].p, 0.1)
+
+    def test_encode_predict_and_rollout_shapes(self):
+        model = toy_world()
+        pixels = torch.randn(2, 4, 3, 32, 32)
         action = torch.randn(2, 4, 4)
         info = model.encode({'pixels': pixels, 'action': action})
         self.assertEqual(tuple(info['emb'].shape), (2, 4, 16))
-        self.assertEqual(tuple(info['act_emb'].shape), (2, 4, 16))
+        self.assertEqual(tuple(info['act_emb'].shape), (2, 4, 4))
         pred = model.predict(info['emb'][:, :3], info['act_emb'][:, :3])
         self.assertEqual(tuple(pred.shape), (2, 3, 16))
-
-    def test_vit_uses_cls_token(self):
-        model = toy_world(TinyViT(16))
-        pixels = torch.randn(2, 4, 3, 8, 8)
-        info = model.encode({'pixels': pixels, 'action': torch.randn(2, 4, 4)})
-        flat = pixels.reshape(8, -1)
-        expected = model.projector(model.encoder.lin(flat)).reshape(2, 4, 16)
-        self.assertTrue(torch.allclose(info['emb'], expected))
-
-    def test_rollout_shape(self):
-        model = toy_world(TinyResNet(16))
-        info = {
-            'pixels': torch.randn(2, 3, 3, 3, 8, 8),
-            'action_history': torch.randn(2, 3, 2, 4),
-        }
-        out = model.rollout(info, torch.randn(2, 3, 2, 4))
-        # H context frames plus T candidate steps.
-        self.assertEqual(tuple(out['predicted_emb'].shape), (2, 3, 5, 16))
+        rollout = model.rollout(
+            {
+                'pixels': torch.randn(2, 3, 3, 3, 32, 32),
+                'action_history': torch.randn(2, 3, 2, 4),
+            },
+            torch.randn(2, 3, 2, 4),
+        )
+        self.assertEqual(tuple(rollout['predicted_emb'].shape), (2, 3, 5, 16))
 
 
 class LossTest(unittest.TestCase):

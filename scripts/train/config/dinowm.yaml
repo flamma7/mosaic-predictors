@@ -1,0 +1,141 @@
+defaults:
+  - _self_
+  - launcher: local
+  - data: pusht
+
+output_model_name: dinowm
+subdir: ${hydra:job.id}
+
+num_workers: 8
+train_split: 0.9
+seed: 3072
+# Table 12 render size, then the encoder resize. DINOv2 ViT-S/14 on a
+# 196 input yields the 14 x 14 x 384 patch grid.
+img_size: 224
+encoder_img_size: 196
+patch_size: 14
+patch_embed_dim: 384
+action_emb_dim: 10
+# Set true to concatenate a proprio embedding onto each patch and include
+# it in the latent target. It shares the action-encoder learning rate.
+use_proprio: true
+proprio_emb_dim: 10
+dump_object: True
+
+trainer:
+  max_epochs: 10 #100
+  devices: auto
+  accelerator: gpu
+  precision: 16-mixed #bf16
+  gradient_clip_val: 1.0
+
+loader:
+  batch_size: 32
+  num_workers: ${num_workers}
+  drop_last: True
+  persistent_workers: True
+  prefetch_factor: 3
+  pin_memory: True
+  shuffle: True
+
+optimizer:
+  type: AdamW
+  weight_decay: 1e-3
+
+predictor_lr: 5.0e-5
+action_encoder_lr: 5.0e-4
+
+wm:
+  history_size: 3
+  num_preds: 1
+
+# After each validation epoch, on the weights just saved. The regular
+# val/* loss is unchanged. Success rates are percents. MSE is the
+# action-stripped latent error against the perturbed encoding.
+# Set a perturbation's enabled flag to false to drop it from both logs.
+validate_extra:
+  enabled: true
+  every_n_epochs: 1
+  mse:
+    enabled: true
+    # Model steps rolled out after the history window. Clips are
+    # history_size + pred_length frames from the validation split.
+    pred_length: 25
+    horizons: [1, 5, 10, 15, 25]
+    # null scores every validation clip long enough for the rollout.
+    num_samples: 64
+  mpc:
+    enabled: true
+    num_eval: 25
+    seed: ${seed}
+    goal_offset_steps: 25
+    eval_budget: 50
+    horizon: 5
+    receding_horizon: 5
+    action_block: ${data.dataset.frameskip}
+    num_samples: 300
+    n_steps: 30
+    topk: 30
+    var_scale: 1.0
+    env_name: swm/PushT-v1
+  perturbations:
+    none:
+      enabled: true
+    blur:
+      enabled: true
+      blur: true
+    snp1:
+      enabled: true
+      salt_pepper: true
+    snp5:
+      enabled: true
+      salt_pepper: 0.05
+    dark:
+      enabled: true
+      dark: 0.7
+    red-agent:
+      enabled: true
+      agent_color: red
+    red-block:
+      enabled: true
+      block_color: red
+    red-anchor:
+      enabled: true
+      anchor_color: red
+
+backbone:
+  name: dinov2_small
+
+model:
+  _target_: stable_worldmodel.wm.PreJEPA
+  history_size: ${wm.history_size}
+  num_pred: ${wm.num_preds}
+  interpolate_pos_encoding: true
+  encoder:
+    _target_: stable_pretraining.backbone.EvalOnly
+    backbone:
+      _target_: stable_worldmodel.wm.prejepa.module.create_backbone
+      name: ${backbone.name}
+  predictor:
+    _target_: stable_worldmodel.wm.prejepa.module.CausalPredictor
+    num_patches: ???
+    num_frames: ${wm.history_size}
+    dim: ???
+    depth: 6
+    heads: 16
+    mlp_dim: 2048
+    dim_head: 64
+    dropout: 0.1
+    emb_dropout: 0.0
+    pool: mean
+  extra_encoders:
+    _target_: torch.nn.ModuleDict
+    modules:
+      proprio:
+        _target_: stable_worldmodel.wm.prejepa.module.Embedder
+        in_chans: ???
+        emb_dim: ${proprio_emb_dim}
+      action:
+        _target_: stable_worldmodel.wm.prejepa.module.Embedder
+        in_chans: ???
+        emb_dim: ${action_emb_dim}

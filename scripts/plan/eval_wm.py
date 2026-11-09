@@ -17,6 +17,48 @@ from torchvision.transforms import v2 as transforms
 import stable_worldmodel as swm
 
 
+def configure_visuals(cfg):
+    """AdaJEPA visual shifts for PushT.
+
+    Returns ``(extra_wrappers, reset_options)``. Image corruptions are frame
+    wrappers, so they run on every rendered observation. Reset
+    ``variation_values`` recolor the scene. ``World`` applies the same
+    wrappers to the initial frame and the goal, and re-renders both when a
+    color variation is set.
+    """
+    visual = cfg.get('visual')
+    if visual is None:
+        return None, None
+    from stable_worldmodel.wrapper.visual import (
+        make_adajepa_wrappers,
+        make_pusht_color_variations,
+    )
+
+    wrappers = make_adajepa_wrappers(
+        blur=visual.get('blur', False),
+        salt_pepper=visual.get('salt_pepper', False),
+        dark=visual.get('dark', False),
+        seed=int(cfg.seed),
+    )
+    colors = make_pusht_color_variations(
+        agent_color=visual.get('agent_color'),
+        block_color=visual.get('block_color'),
+        anchor_color=visual.get('anchor_color'),
+    )
+    options = {'variation_values': colors} if colors else None
+    if wrappers or options:
+        print(
+            '[eval] visual perturbations '
+            f'blur={visual.get("blur", False)} '
+            f'salt_pepper={visual.get("salt_pepper", False)} '
+            f'dark={visual.get("dark", False)} '
+            f'agent_color={visual.get("agent_color")} '
+            f'block_color={visual.get("block_color")} '
+            f'anchor_color={visual.get("anchor_color")}'
+        )
+    return (wrappers or None), options
+
+
 def img_transform(cfg, dtype=torch.float32):
     transform = transforms.Compose(
         [
@@ -73,7 +115,12 @@ def run(cfg: DictConfig):
 
     # create world environment
     cfg.world.max_episode_steps = 2 * cfg.eval.eval_budget
-    world = swm.World(**cfg.world, image_shape=(224, 224))
+    extra_wrappers, reset_options = configure_visuals(cfg)
+    world = swm.World(
+        **cfg.world,
+        image_shape=(224, 224),
+        extra_wrappers=extra_wrappers,
+    )
 
     # create the transform
     img_dtype = torch.bfloat16 if cfg.get('bf16', False) else torch.float32
@@ -141,13 +188,17 @@ def run(cfg: DictConfig):
     else:
         policy = swm.policy.RandomPolicy()
 
-    results_path = (
-        Path(
+    # output.directory, when set, collects results.txt and any eval videos.
+    # Otherwise results stay next to the checkpoint, as before.
+    output_dir = cfg.output.get('directory')
+    if output_dir:
+        results_dir = Path(output_dir)
+    elif cfg.policy != 'random':
+        results_dir = Path(
             swm.data.utils.get_cache_dir(sub_folder='checkpoints'), cfg.policy
         ).parent
-        if cfg.policy != 'random'
-        else Path(__file__).parent
-    )
+    else:
+        results_dir = Path(__file__).parent
 
     # sample the episodes and the starting indices
     episode_len = get_episodes_length(dataset, ep_indices)
@@ -189,9 +240,9 @@ def run(cfg: DictConfig):
 
     world.set_policy(policy)
 
-    results_path.mkdir(parents=True, exist_ok=True)
+    results_dir.mkdir(parents=True, exist_ok=True)
     # null/false skips mp4s. World.evaluate records only when video is a directory.
-    video_dir = results_path if cfg.get('video', True) else None
+    video_dir = results_dir if cfg.get('video', True) else None
     if video_dir is None:
         print('[eval] skipping videos')
     else:
@@ -225,6 +276,7 @@ def run(cfg: DictConfig):
                     cfg.eval.get('callables'), resolve=True
                 ),
                 video=video_dir,
+                options=reset_options,
             )
         print('Warmup done.')
 
@@ -240,6 +292,7 @@ def run(cfg: DictConfig):
                 cfg.eval.get('callables'), resolve=True
             ),
             video=video_dir,
+            options=reset_options,
         )
     end_time = time.time()
 
@@ -247,7 +300,7 @@ def run(cfg: DictConfig):
     if video_dir is not None:
         print(f'[eval] videos saved to {video_dir.resolve()}')
 
-    results_path = results_path / cfg.output.filename
+    results_path = results_dir / cfg.output.filename
     results_path.parent.mkdir(parents=True, exist_ok=True)
 
     with results_path.open('a') as f:
