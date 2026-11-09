@@ -29,7 +29,8 @@ export STABLEWM_HOME HF_HOME
 
 SWM_REV="21446f1ede6d5284e981bd7b47f432b994e6d812"
 SWM_URL="https://github.com/galilai-group/stable-worldmodel.git"
-SWM_SRC="${STABLEWM_HOME}/src/stable-worldmodel"
+# Same relative path pyproject.toml and uv.lock already use.
+SWM_SRC="$(dirname "${ROOT}")/stable-worldmodel"
 PATCH="${ROOT}/patches/stable-worldmodel.patch"
 
 if [[ -n "${PYTHON:-}" ]]; then
@@ -108,8 +109,8 @@ restore_setup_files() {
 trap restore_setup_files EXIT
 printf '%s\n' torch torchvision > "${EXCLUDES}"
 
-# --directory and --no-config keep uv from reading this repo's pyproject,
-# which points stable-worldmodel at the desktop checkout. Leave the image
+# --directory and --no-config keep uv from reading this repo's pyproject
+# during the stable-worldmodel install. Leave the image
 # torch/torchvision in place. [env] is pygame, pymunk, and opencv for PushT
 # MPC. [format] is the Lance dataset. [train] is transformers (DINOv2),
 # stable-pretraining, and Lightning. scikit-learn is imported by the MPC
