@@ -1,0 +1,727 @@
+diff --git a/stable_worldmodel/data/formats/lance.py b/stable_worldmodel/data/formats/lance.py
+index ff75918..11633f1 100644
+--- a/stable_worldmodel/data/formats/lance.py
++++ b/stable_worldmodel/data/formats/lance.py
+@@ -240,12 +240,19 @@ def _force_forkserver() -> None:
+ 
+     lance runs an internal async (Tokio) runtime; forking a process that has
+     already started it leaves the child with a half-initialized runtime that
+-    can deadlock. ``forkserver`` launches a clean helper interpreter (with no
+-    lance runtime) and forks DataLoader workers from *that*, so each worker
+-    opens lance after the fork and gets its own runtime — the start method
+-    lancedb itself recommends. Worker startup is also cheaper than ``spawn``
+-    (a fork of the clean server vs a full re-exec + re-import per worker).
+-    Falls back to ``spawn`` where forkserver is unavailable.
++    can deadlock. The same deadlock hits any DataLoader forked after CUDA or
++    the allocator has started background threads, which is the usual state
++    once Lightning sanity validation has run. ``forkserver`` launches a clean
++    helper interpreter (with no lance runtime and no CUDA context) and forks
++    DataLoader workers from *that*, so each worker opens lance after the fork
++    and gets its own runtime — the start method lancedb itself recommends.
++    Worker startup is also cheaper than ``spawn`` (a fork of the clean server
++    vs a full re-exec + re-import per worker). Falls back to ``spawn`` where
++    forkserver is unavailable.
++
++    Called at import of this module, not only from :class:`LanceDataset`:
++    importing the data package imports lancedb even when the dataset on disk
++    is HDF5.
+ 
+     The server preloads :data:`_FORKSERVER_PRELOAD` (heavy, fork-benign
+     modules only — never lance itself) so each worker forks with the
+@@ -296,6 +303,19 @@ def _force_forkserver() -> None:
+         pass
+ 
+ 
++# Importing this module imports lancedb, which starts a background thread
++# and registers an at-fork hook. That happens for every reader — HDF5
++# included — because the format registry imports Lance whenever lancedb is
++# installed. A later DataLoader on the default ``fork`` start method then
++# copies that thread, plus any CUDA or allocator threads created during
++# sanity validation. Locks held by threads that do not survive the fork
++# stay locked in the child, so one worker can sit in ``futex_wait`` forever
++# and training stalls after the first batch (the batch the surviving worker
++# already produced). Switch start methods at import, before any caller
++# constructs a DataLoader.
++_force_forkserver()
++
++
+ class LanceDataset(Dataset):
+     """Reader for a LanceDB table written by :class:`LanceWriter`.
+ 
+diff --git a/stable_worldmodel/envs/pusht/env.py b/stable_worldmodel/envs/pusht/env.py
+index 38d8c7f..de5dc5c 100644
+--- a/stable_worldmodel/envs/pusht/env.py
++++ b/stable_worldmodel/envs/pusht/env.py
+@@ -374,6 +374,49 @@ class PushT(gym.Env):
+     def render(self):
+         return self._render_frame(self.render_mode)
+ 
++    def _place_bodies(self, state):
++        """Move the agent and block to ``state`` and flush the draw transform.
++
++        Velocity is zeroed before the flush step so the pose does not
++        integrate. Angle is set before position, matching ``_set_state``.
++        """
++        state = np.asarray(state, dtype=np.float64).reshape(-1)
++        self.block.velocity = (0.0, 0.0)
++        self.block.angle = float(state[4])
++        self.block.position = state[2:4].tolist()
++        self.agent.velocity = (0.0, 0.0)
++        self.agent.position = state[:2].tolist()
++        self.space.step(self.dt)
++
++    def render_state(self, state, goal_pose=None):
++        """Draw ``state`` with the current colors and restore the episode pose.
++
++        ``goal_pose`` temporarily moves the fixed anchor tee.
++        """
++        saved_state = self._get_obs().copy()
++        saved_velocity = (
++            tuple(self.agent.velocity),
++            tuple(self.block.velocity),
++        )
++        saved_pose = (
++            None
++            if self.goal_pose is None
++            else np.array(self.goal_pose, copy=True)
++        )
++        try:
++            if goal_pose is not None:
++                self.goal_pose = np.asarray(
++                    goal_pose, dtype=np.float64
++                ).reshape(-1)
++            self._place_bodies(state)
++            return self.render()
++        finally:
++            self._place_bodies(saved_state)
++            self.agent.velocity = saved_velocity[0]
++            self.block.velocity = saved_velocity[1]
++            if saved_pose is not None:
++                self.goal_pose = saved_pose
++
+     def _get_obs(self):
+         obs = (
+             tuple(self.agent.position)
+diff --git a/stable_worldmodel/world/world.py b/stable_worldmodel/world/world.py
+index cb360d3..515e07b 100644
+--- a/stable_worldmodel/world/world.py
++++ b/stable_worldmodel/world/world.py
+@@ -217,7 +217,11 @@ class World:
+         Args:
+             episodes: Total episodes to roll out (episodic mode).
+             seed: Base seed. Per-env seeds are derived by offsetting it.
+-            options: Reset options forwarded to ``envs.reset``.
++            options: Reset options forwarded to ``envs.reset``, including
++                dataset-driven eval. ``variation_values`` re-renders the
++                initial observation and the goal image. Frame wrappers are
++                applied to both, since dataset eval writes those images
++                into ``info`` after ``reset``.
+             video: Directory to write one mp4 per episode/env (optional).
+             reset_mode: ``'auto'`` (reset terminated envs) or ``'wait'``
+                 (freeze terminated envs and stop when all are done).
+@@ -250,6 +254,7 @@ class World:
+                 callables,
+                 video,
+                 mode,
++                options,
+             )
+         mode = reset_mode or 'auto'
+         return self._evaluate(episodes, seed, options, video, mode)
+@@ -532,6 +537,7 @@ class World:
+         callables,
+         video,
+         mode,
++        options=None,
+     ) -> dict:
+         n = len(episodes_idx)
+         assert n == self.num_envs
+@@ -568,9 +574,13 @@ class World:
+                 )
+                 for i in range(n)
+             ]
++            if options:
++                opts_list = [
++                    _with_variation_values(opt, options) for opt in opts_list
++                ]
+             self.reset(seed=seeds, options=opts_list)
+         else:
+-            self.reset(seed=seeds)
++            self.reset(seed=seeds, options=options)
+             if callables:
+                 for i in range(n):
+                     env_init = {**init_rows[i], **goal_rows[i]}
+@@ -578,6 +588,16 @@ class World:
+                         self.envs.envs[i].unwrapped, callables, env_init
+                     )
+ 
++        # Dataset frames are copied into infos below and never pass through
++        # the wrapper step. Re-render them when variation values change
++        # appearance, then run the same frame wrappers used on later steps.
++        _apply_configured_visuals(
++            self.envs.envs,
++            init_rows,
++            goal_rows,
++            rerender=_has_variation_values(options),
++        )
++
+         # Inject dataset values into the batched infos: columns whose
+         # per-episode values share one shape are stacked to (N, ...) and
+         # broadcast over the time dim. Episode-scoped columns are excluded
+@@ -691,6 +711,97 @@ def _extract_init_goal(dataset, episodes_idx, start_steps, goal_offset):
+     return init_rows, goal_rows, dataset_videos
+ 
+ 
++def _frame_transforms(env):
++    """``_apply`` callables from frame wrappers, inner wrapper first."""
++    chain = []
++    seen = set()
++    current = env
++    while current is not None and id(current) not in seen:
++        seen.add(id(current))
++        chain.append(current)
++        current = getattr(current, 'env', None)
++    applies = []
++    for wrapper in reversed(chain):
++        if getattr(wrapper, 'transforms_frames', False):
++            applies.append(wrapper._apply)
++    return applies
++
++
++def _has_variation_values(options):
++    if not options:
++        return False
++    if isinstance(options, list):
++        return any(
++            isinstance(item, dict) and item.get('variation_values')
++            for item in options
++        )
++    return bool(options.get('variation_values'))
++
++
++def _with_variation_values(env_options, override):
++    """Copy ``override['variation_values']`` into one env's reset options."""
++    if not override:
++        return env_options
++    merged = dict(env_options or {})
++    extra = override.get('variation_values')
++    if extra:
++        values = dict(merged.get('variation_values') or {})
++        values.update(extra)
++        merged['variation_values'] = values
++    return merged
++
++
++def _render_configured_frame(env, state, goal_pose):
++    render_state = getattr(env.unwrapped, 'render_state', None)
++    if render_state is None or state is None:
++        return None
++    return render_state(state, goal_pose=goal_pose)
++
++
++def _transform_frame(frame, applies):
++    if not isinstance(frame, np.ndarray) or frame.ndim < 3:
++        return frame
++    for apply in applies:
++        frame = apply(frame)
++    return frame
++
++
++def _apply_configured_visuals(envs, init_rows, goal_rows, rerender):
++    """Perturb the dataset frames that bypass ``env.step``.
++
++    Later steps already run the frame wrappers. This covers the initial
++    observation and the goal image, which are injected from the dataset.
++    Color variations are drawn by ``render_state`` before those wrappers.
++    """
++    if not init_rows:
++        return
++    for i, env in enumerate(envs):
++        applies = _frame_transforms(env)
++        if not applies and not rerender:
++            continue
++        goal_pose = init_rows[i].get('goal_pose')
++        if rerender:
++            rendered = _render_configured_frame(
++                env, init_rows[i].get('state'), goal_pose
++            )
++            if rendered is not None:
++                init_rows[i]['pixels'] = rendered
++            rendered_goal = _render_configured_frame(
++                env, goal_rows[i].get('goal_state'), goal_pose
++            )
++            if rendered_goal is not None:
++                goal_rows[i]['goal'] = rendered_goal
++        if applies:
++            if 'pixels' in init_rows[i]:
++                init_rows[i]['pixels'] = _transform_frame(
++                    init_rows[i]['pixels'], applies
++                )
++            if 'goal' in goal_rows[i]:
++                goal_rows[i]['goal'] = _transform_frame(
++                    goal_rows[i]['goal'], applies
++                )
++
++
+ def _apply_callables(env, callables, init_state):
+     for spec in callables:
+         method = spec['method']
+diff --git a/stable_worldmodel/wrapper/__init__.py b/stable_worldmodel/wrapper/__init__.py
+index 2c32d9e..e3c64d2 100644
+--- a/stable_worldmodel/wrapper/__init__.py
++++ b/stable_worldmodel/wrapper/__init__.py
+@@ -32,6 +32,7 @@ _LAZY_VISUAL = frozenset(
+         'ChromaKeyWrapper',
+         'ColorJitterWrapper',
+         'CutoutWrapper',
++        'DarkWrapper',
+         'GrayscaleWrapper',
+         'MovingPatchWrapper',
+         'NoiseWrapper',
+@@ -39,10 +40,13 @@ _LAZY_VISUAL = frozenset(
+         'RandomConvWrapper',
+         'RandomShiftWrapper',
+         'ResolutionWrapper',
++        'SaltPepperWrapper',
+         'constant',
+         'cosine',
+         'exponential',
+         'linear',
++        'make_adajepa_wrappers',
++        'make_pusht_color_variations',
+         'sinusoidal',
+     }
+ )
+@@ -53,6 +57,7 @@ if TYPE_CHECKING:
+         ChromaKeyWrapper,
+         ColorJitterWrapper,
+         CutoutWrapper,
++        DarkWrapper,
+         GrayscaleWrapper,
+         MovingPatchWrapper,
+         NoiseWrapper,
+@@ -60,10 +65,13 @@ if TYPE_CHECKING:
+         RandomConvWrapper,
+         RandomShiftWrapper,
+         ResolutionWrapper,
++        SaltPepperWrapper,
+         constant,
+         cosine,
+         exponential,
+         linear,
++        make_adajepa_wrappers,
++        make_pusht_color_variations,
+         sinusoidal,
+     )
+ 
+@@ -94,6 +102,7 @@ __all__ = [
+     'ChromaKeyWrapper',
+     'ColorJitterWrapper',
+     'CutoutWrapper',
++    'DarkWrapper',
+     'EnsureGoalInfoWrapper',
+     'EnsureImageShape',
+     'EnsureInfoKeysWrapper',
+@@ -108,9 +117,12 @@ __all__ = [
+     'RandomShiftWrapper',
+     'ResizeGoalWrapper',
+     'ResolutionWrapper',
++    'SaltPepperWrapper',
+     'constant',
+     'cosine',
+     'exponential',
+     'linear',
++    'make_adajepa_wrappers',
++    'make_pusht_color_variations',
+     'sinusoidal',
+ ]
+diff --git a/stable_worldmodel/wrapper/visual.py b/stable_worldmodel/wrapper/visual.py
+index f73192c..d658428 100644
+--- a/stable_worldmodel/wrapper/visual.py
++++ b/stable_worldmodel/wrapper/visual.py
+@@ -1,12 +1,12 @@
+ import math
+ import pathlib
++from functools import partial
+ 
+ import cv2
+ import gymnasium as gym
+ import imageio.v3 as iio
+ import numpy as np
+ 
+-
+ VIDEO_EXTS = {'.mp4', '.mov', '.avi', '.webm', '.gif', '.mkv'}
+ 
+ 
+@@ -53,15 +53,35 @@ def sinusoidal(low, high, period):
+     )
+ 
+ 
++def _is_image(value):
++    return (
++        isinstance(value, np.ndarray)
++        and value.ndim >= 3
++        and value.shape[-1] in (1, 3, 4)
++    )
++
++
+ class _PixelTransform(gym.Wrapper):
+-    """Base class that applies ``_apply`` to ``render()`` output and to ``info['pixels*']``."""
++    """Base class that applies ``_apply`` to rendered frames.
++
++    ``transforms_frames`` marks wrappers whose ``_apply`` should also run on
++    dataset-injected observations. Dataset eval writes the initial frame and
++    the goal image into ``info`` after ``reset``, so those frames never pass
++    through ``step``.
++    """
++
++    transforms_frames = True
+ 
+     def _apply(self, frame):
+         raise NotImplementedError
+ 
+     def _apply_to_info(self, info):
+-        for k, v in info.items():
+-            if k == 'pixels' or k.startswith('pixels.'):
++        for k, v in list(info.items()):
++            if (
++                k == 'pixels'
++                or k.startswith('pixels.')
++                or (k == 'goal' and _is_image(v))
++            ):
+                 info[k] = self._apply(v)
+         return info
+ 
+@@ -218,6 +238,49 @@ class ColorJitterWrapper(_PixelTransform):
+         return super().reset(**kwargs)
+ 
+ 
++def adajepa_blur_kernel(sigma):
++    """Odd Gaussian kernel used by AdaJEPA for a given ``sigma``."""
++    return max(3, int(2 * round(3 * float(sigma)) + 1))
++
++
++def apply_blur(frame, sigma):
++    """AdaJEPA Gaussian blur: ``cv2.GaussianBlur`` with sigma on both axes."""
++    kernel = adajepa_blur_kernel(sigma)
++    return cv2.GaussianBlur(
++        frame, (kernel, kernel), sigmaX=float(sigma), sigmaY=float(sigma)
++    )
++
++
++def apply_salt_pepper(frame, density, rng):
++    """AdaJEPA salt-and-pepper noise.
++
++    ``density`` is the fraction set to white and, separately, to black.
++
++    ``n = int(density * H * W)`` pixels are set to 255, then ``n`` to 0.
++    Pepper is written second, so a collision becomes black. Samples are with
++    replacement. ``rng`` is a ``numpy.random.RandomState``.
++    """
++    frame = np.asarray(frame)
++    height, width = frame.shape[:2]
++    out = frame.copy()
++    count = int(density * height * width)
++    if count <= 0:
++        return out
++    ys = rng.randint(0, height, count)
++    xs = rng.randint(0, width, count)
++    out[ys, xs] = 255
++    ys = rng.randint(0, height, count)
++    xs = rng.randint(0, width, count)
++    out[ys, xs] = 0
++    return out
++
++
++def apply_dark(frame, factor):
++    """AdaJEPA darkening: multiply uint8 pixels by ``factor`` and cast back."""
++    out = np.asarray(frame).astype(np.float32) * float(factor)
++    return np.clip(out, 0, 255).astype(np.uint8)
++
++
+ class BlurWrapper(_PixelTransform):
+     """Gaussian blur with odd ``kernel`` size and standard deviation ``sigma`` (0 = derived from kernel)."""
+ 
+@@ -228,10 +291,44 @@ class BlurWrapper(_PixelTransform):
+ 
+     def _apply(self, frame):
+         return cv2.GaussianBlur(
+-            frame, (self._kernel, self._kernel), self._sigma
++            frame,
++            (self._kernel, self._kernel),
++            sigmaX=self._sigma,
++            sigmaY=self._sigma,
+         )
+ 
+ 
++class SaltPepperWrapper(_PixelTransform):
++    """Per-frame salt-and-pepper noise.
++
++    ``density`` is the fraction of pixels set to white and, separately, the
++    fraction set to black. AdaJEPA's ``snp1`` condition is ``density=0.01``
++    and ``snp5`` is ``0.05``.
++    """
++
++    def __init__(self, env, density=0.01, seed=0):
++        super().__init__(env)
++        self._density = float(density)
++        self._rng = np.random.RandomState(seed)
++
++    def _apply(self, frame):
++        return apply_salt_pepper(frame, self._density, self._rng)
++
++
++class DarkWrapper(_PixelTransform):
++    """Darken a frame by multiplying every channel by ``factor``.
++
++    AdaJEPA's dark condition uses ``factor=0.5``.
++    """
++
++    def __init__(self, env, factor=0.5):
++        super().__init__(env)
++        self._factor = float(factor)
++
++    def _apply(self, frame):
++        return apply_dark(frame, self._factor)
++
++
+ class OcclusionWrapper(_PixelTransform):
+     """Cover the frame with ``num_patches`` rectangles of fractional ``size``. Patches resample per reset."""
+ 
+@@ -453,3 +550,89 @@ class ResolutionWrapper(_PixelTransform):
+         sh = max(1, int(round(h * self._scale)))
+         small = cv2.resize(frame, (sw, sh), interpolation=cv2.INTER_AREA)
+         return cv2.resize(small, (w, h), interpolation=cv2.INTER_NEAREST)
++
++
++# pygame.Color('Red'). AdaJEPA sets agent, block, and anchor via this name.
++ADAJEPA_RED = np.array([255, 0, 0], dtype=np.uint8)
++
++_NAMED_COLORS = {'red': ADAJEPA_RED}
++
++
++def parse_color(value):
++    """RGB uint8 color from ``'red'`` or a length-3 sequence."""
++    if value is None:
++        return None
++    if isinstance(value, str):
++        key = value.strip().lower()
++        if key not in _NAMED_COLORS:
++            known = ', '.join(sorted(_NAMED_COLORS))
++            raise ValueError(f'Unknown color {value!r}. Known names: {known}.')
++        return _NAMED_COLORS[key].copy()
++    color = np.asarray(list(value), dtype=np.uint8).reshape(3)
++    return np.array(color, copy=True)
++
++
++def make_adajepa_wrappers(blur=False, salt_pepper=False, dark=False, seed=0):
++    """Build frame wrappers at AdaJEPA's visual-shift settings.
++
++    Each flag accepts ``False``/``None`` (off), ``True`` (the paper default),
++    or a number overriding that default:
++
++    - blur: sigma, default ``2.0``. Kernel is ``adajepa_blur_kernel(sigma)``
++      (13 when sigma is 2).
++    - salt_pepper: per-channel density, default ``0.01`` (``snp1``). ``0.05``
++      is AdaJEPA's ``snp5``.
++    - dark: brightness multiplier, default ``0.5``.
++
++    Salt-and-pepper uses ``seed + env_index`` so each env differs and a run
++    stays reproducible. The returned callables take an env and return a
++    wrapped env, which is what ``World(extra_wrappers=...)`` expects.
++    """
++    wrappers = []
++    if blur not in (False, None):
++        sigma = 2.0 if blur is True else float(blur)
++        wrappers.append(
++            partial(
++                BlurWrapper,
++                kernel=adajepa_blur_kernel(sigma),
++                sigma=sigma,
++            )
++        )
++    if salt_pepper not in (False, None):
++        density = 0.01 if salt_pepper is True else float(salt_pepper)
++        wrappers.append(_per_env(SaltPepperWrapper, seed, density=density))
++    if dark not in (False, None):
++        factor = 0.5 if dark is True else float(dark)
++        wrappers.append(partial(DarkWrapper, factor=factor))
++    return wrappers
++
++
++def make_pusht_color_variations(
++    agent_color=None, block_color=None, anchor_color=None
++):
++    """PushT ``variation_values`` for AdaJEPA's red-object conditions.
++
++    ``anchor_color`` is the fixed goal tee (``goal.color``). Returns ``None``
++    when every argument is ``None``.
++    """
++    values = {}
++    if agent_color is not None:
++        values['agent.color'] = parse_color(agent_color)
++    if block_color is not None:
++        values['block.color'] = parse_color(block_color)
++    if anchor_color is not None:
++        values['goal.color'] = parse_color(anchor_color)
++    return values or None
++
++
++def _per_env(cls, seed, **kwargs):
++    """Call ``cls(env, seed=seed+i, **kwargs)`` with a fresh index per env."""
++    index = {'i': 0}
++
++    def factory(env):
++        i = index['i']
++        index['i'] += 1
++        env_seed = None if seed is None else int(seed) + i
++        return cls(env, seed=env_seed, **kwargs)
++
++    return factory
+diff --git a/tests/envs/test_pusht_env.py b/tests/envs/test_pusht_env.py
+index 0ff5b18..ae1303d 100644
+--- a/tests/envs/test_pusht_env.py
++++ b/tests/envs/test_pusht_env.py
+@@ -54,3 +54,27 @@ def test_pusht_eval_state_respects_block_shape_rotation_symmetry(
+ 
+     assert bool(success) is expected_success
+     assert distance == pytest.approx(expected_distance)
++
++
++def test_pusht_render_state_keeps_pose_and_uses_variation_color():
++    env = PushT()
++    try:
++        red = np.array([255, 0, 0], dtype=np.uint8)
++        env.reset(
++            seed=0,
++            options={'variation_values': {'agent.color': red}},
++        )
++        state = env._get_obs().copy()
++        original = env.render()
++        assert (original == red).all(axis=-1).sum() > 10
++
++        moved = state.copy()
++        moved[:2] += 40
++        shifted = env.render_state(moved)
++        restored = env._get_obs()
++    finally:
++        env.close()
++
++    assert shifted.shape == original.shape
++    assert not np.array_equal(shifted, original)
++    assert np.allclose(restored, state)
+diff --git a/tests/test_visual_perturbation.py b/tests/test_visual_perturbation.py
+new file mode 100644
+index 0000000..72d74b0
+--- /dev/null
++++ b/tests/test_visual_perturbation.py
+@@ -0,0 +1,110 @@
++from unittest.mock import MagicMock
++
++import cv2
++import gymnasium as gym
++import numpy as np
++
++from stable_worldmodel.world.world import _apply_configured_visuals
++from stable_worldmodel.wrapper.visual import (
++    DarkWrapper,
++    adajepa_blur_kernel,
++    apply_blur,
++    apply_dark,
++    apply_salt_pepper,
++    make_adajepa_wrappers,
++    make_pusht_color_variations,
++)
++
++
++def _dummy_env():
++    env = MagicMock(spec=gym.Env)
++    env.observation_space = gym.spaces.Box(low=0, high=1, shape=(1,))
++    env.action_space = gym.spaces.Box(low=0, high=1, shape=(1,))
++    return env
++
++
++def test_adajepa_blur_matches_cv2_kernel():
++    assert adajepa_blur_kernel(2.0) == 13
++    frame = np.arange(16 * 16 * 3, dtype=np.uint8).reshape(16, 16, 3)
++    expected = cv2.GaussianBlur(frame, (13, 13), sigmaX=2.0, sigmaY=2.0)
++    assert np.array_equal(apply_blur(frame, 2.0), expected)
++
++
++def test_salt_pepper_writes_equal_salt_and_pepper_counts():
++    frame = np.full((10, 10, 3), 128, dtype=np.uint8)
++    out = apply_salt_pepper(frame, 0.01, np.random.RandomState(0))
++    # n = int(0.01 * 100) = 1, and seed 0 does not collide.
++    assert (out == 255).all(axis=-1).sum() == 1
++    assert (out == 0).all(axis=-1).sum() == 1
++    assert np.all(frame == 128)
++
++
++def test_dark_multiplies_then_truncates_to_uint8():
++    frame = np.full((2, 2, 3), 201, dtype=np.uint8)
++    out = apply_dark(frame, 0.5)
++    assert out.dtype == np.uint8
++    assert np.all(out == 100)
++
++
++def test_dark_wrapper_perturbs_goal_image_and_not_goal_state():
++    wrapped = DarkWrapper(_dummy_env(), factor=0.5)
++    info = {
++        'pixels': np.full((2, 2, 3), 200, dtype=np.uint8),
++        'goal': np.full((2, 2, 3), 200, dtype=np.uint8),
++        'goal_state': np.zeros(7),
++    }
++    out = wrapped._apply_to_info(info)
++    assert np.all(out['pixels'] == 100)
++    assert np.all(out['goal'] == 100)
++    assert np.all(out['goal_state'] == 0)
++
++
++def test_adajepa_wrapper_defaults():
++    assert make_adajepa_wrappers() == []
++    blur = make_adajepa_wrappers(blur=True)[0](_dummy_env())
++    assert blur._kernel == 13
++    assert blur._sigma == 2.0
++    snp = make_adajepa_wrappers(salt_pepper=True, seed=3)[0](_dummy_env())
++    assert snp._density == 0.01
++    snp5 = make_adajepa_wrappers(salt_pepper=0.05, seed=3)[0](_dummy_env())
++    assert snp5._density == 0.05
++    dark = make_adajepa_wrappers(dark=True)[0](_dummy_env())
++    assert dark._factor == 0.5
++
++
++def test_pusht_red_is_pygame_red():
++    red = np.array([255, 0, 0], dtype=np.uint8)
++    values = make_pusht_color_variations(
++        agent_color='Red',
++        block_color=[255, 0, 0],
++        anchor_color='red',
++    )
++    assert np.array_equal(values['agent.color'], red)
++    assert np.array_equal(values['block.color'], red)
++    assert np.array_equal(values['goal.color'], red)
++    assert make_pusht_color_variations() is None
++
++
++def test_dataset_frames_get_the_same_wrapper_as_later_steps():
++    class FrameEnv:
++        transforms_frames = True
++
++        def __init__(self):
++            self.env = None
++            self.calls = 0
++
++        def _apply(self, frame):
++            self.calls += 1
++            return frame + 1
++
++    env = FrameEnv()
++    pixels = np.zeros((2, 2, 3), dtype=np.uint8)
++    goal = np.zeros((2, 2, 3), dtype=np.uint8)
++    init_rows = [{'pixels': pixels, 'state': np.zeros(7)}]
++    goal_rows = [{'goal': goal, 'goal_state': np.ones(7)}]
++
++    _apply_configured_visuals([env], init_rows, goal_rows, rerender=False)
++
++    assert np.all(init_rows[0]['pixels'] == 1)
++    assert np.all(goal_rows[0]['goal'] == 1)
++    assert env.calls == 2

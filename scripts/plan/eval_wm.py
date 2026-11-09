@@ -3,6 +3,9 @@
 import os
 
 os.environ['MUJOCO_GL'] = 'egl'
+# PushT renders with pygame. A RunPod image has no display, and pygame
+# refuses to create a surface unless a video driver exists.
+os.environ.setdefault('SDL_VIDEODRIVER', 'dummy')
 
 import time
 from pathlib import Path
