@@ -6,17 +6,16 @@ decreases even though each episode is still one contiguous run. This
 copies those runs into a new table in ``episode_idx`` order. It does not
 re-encode frames.
 
-The new table is written beside the source and needs about as much free
-disk as the source takes. After a check that every ``(episode_idx,
-step_idx)`` survived, the source directory is renamed to
-``<name>.lance.bak`` and the new table takes its place.
+Fragments cover a short span of episodes. Once every episode in a
+fragment has been copied, that fragment is removed and its files are
+deleted, so the rewrite does not need a second copy of the table.
 
 Usage on the training machine::
 
     python scripts/train/repair_dino_order.py
 
 Resume is automatic. ``--overwrite`` drops a partial rewrite and starts
-again. Delete the ``.bak`` directory once training has opened the new table.
+again; it refuses once source fragments have already been deleted.
 """
 
 from __future__ import annotations
@@ -25,6 +24,7 @@ import argparse
 import os
 import shutil
 import time
+from datetime import timedelta
 from pathlib import Path
 
 import numpy as np
@@ -50,7 +50,7 @@ def _parse():
         '--rows-per-commit',
         type=int,
         default=2048,
-        help='Frames per Lance commit. A crash loses at most one commit.',
+        help='Frames copied per commit. A crash loses at most one commit.',
     )
     parser.add_argument(
         '--overwrite',
@@ -62,20 +62,32 @@ def _parse():
 
 def _dir_bytes(path: Path) -> int:
     total = 0
+    if not path.exists():
+        return 0
     for dirpath, _, filenames in os.walk(path):
         for name in filenames:
             total += os.path.getsize(os.path.join(dirpath, name))
     return total
 
 
-def _runs(episode_idx: np.ndarray, step_idx: np.ndarray):
-    """``(episode, start_row, end_row)`` in episode_idx order.
+def _in_order(episode_idx: np.ndarray) -> bool:
+    if len(episode_idx) < 2:
+        return True
+    return not (np.diff(episode_idx.astype(np.int64)) < 0).any()
 
-    Each episode must already be one contiguous run. Within a run, row
-    order is kept, so frame order inside an episode does not change.
-    """
+
+def _column(dataset, name: str) -> np.ndarray:
+    return (
+        dataset.to_table(columns=[name])
+        .column(name)
+        .to_numpy(zero_copy_only=False)
+    )
+
+
+def _scan_runs(episode_idx: np.ndarray, step_idx: np.ndarray):
+    """Contiguous ``(episode, start_row, end_row)`` runs, in scan order."""
     if len(episode_idx) == 0:
-        raise SystemExit('Source table has no rows.')
+        return []
     if len(episode_idx) != len(step_idx):
         raise SystemExit('episode_idx and step_idx have different lengths.')
     change = np.flatnonzero(np.diff(episode_idx) != 0) + 1
@@ -99,83 +111,53 @@ def _runs(episode_idx: np.ndarray, step_idx: np.ndarray):
             )
         seen.add(episode)
         runs.append((episode, start, end))
-    runs.sort(key=lambda run: run[0])
     return runs
 
 
-def _in_order(episode_idx: np.ndarray) -> bool:
-    if len(episode_idx) < 2:
-        return True
-    return not (np.diff(episode_idx.astype(np.int64)) < 0).any()
+def _fragment_bounds(dataset):
+    bounds = []
+    offset = 0
+    for fragment in dataset.get_fragments():
+        count = int(fragment.count_rows())
+        bounds.append((fragment.fragment_id, offset, offset + count))
+        offset += count
+    return bounds
 
 
-def _column(dataset, name: str) -> np.ndarray:
-    return (
-        dataset.to_table(columns=[name])
-        .column(name)
-        .to_numpy(zero_copy_only=False)
-    )
-
-
-def _prefix_length(dest_dataset, runs, step_idx) -> int:
-    """Rows of the sorted episode prefix already stored, or exit."""
-    if dest_dataset is None or dest_dataset.count_rows() == 0:
-        return 0
-    got_episode = _column(dest_dataset, 'episode_idx').astype(np.int64, copy=False)
-    got_step = _column(dest_dataset, 'step_idx').astype(np.int64, copy=False)
-    if not _in_order(got_episode):
-        raise SystemExit(
-            'Partial rewrite is itself out of episode order. Re-run with '
-            '--overwrite.'
-        )
-    covered = 0
+def _locate(runs, bounds):
+    """Map each scan run to ``(episode, fragment_id, local_start, local_end)``."""
+    if not runs:
+        return [], {}
+    starts = np.array([start for _, start, _ in bounds], dtype=np.int64)
+    located = []
+    frag_episodes: dict[int, set[int]] = {}
     for episode, start, end in runs:
-        length = end - start
-        if covered + length > len(got_episode):
-            if covered != len(got_episode):
-                raise SystemExit(
-                    'Partial rewrite ends in the middle of an episode. '
-                    'Re-run with --overwrite.'
-                )
-            return covered
-        if not np.array_equal(
-            got_episode[covered : covered + length],
-            np.full(length, episode, dtype=np.int64),
-        ) or not np.array_equal(
-            got_step[covered : covered + length],
-            step_idx[start:end].astype(np.int64, copy=False),
-        ):
+        index = int(np.searchsorted(starts, start, side='right') - 1)
+        if index < 0 or index >= len(bounds):
+            raise SystemExit(f'episode {episode} does not fall in a fragment.')
+        frag_id, frag_start, frag_end = bounds[index]
+        if end > frag_end:
             raise SystemExit(
-                'Partial rewrite does not match the source episode order. '
-                'Re-run with --overwrite.'
+                f'episode {episode} spans two fragments and cannot be '
+                'reclaimed one fragment at a time.'
             )
-        covered += length
-    if covered != len(got_episode):
-        raise SystemExit(
-            f'Partial rewrite has {len(got_episode)} rows but the matching '
-            f'episode prefix is {covered}. Re-run with --overwrite.'
-        )
-    return covered
+        located.append((episode, int(frag_id), start - frag_start, end - frag_start))
+        frag_episodes.setdefault(int(frag_id), set()).add(episode)
+    located.sort(key=lambda run: run[0])
+    return located, frag_episodes
 
 
-def _batches(runs, rows_per_commit: int):
-    batch = []
-    rows = 0
-    for run in runs:
-        batch.append(run)
-        rows += run[2] - run[1]
-        if rows >= rows_per_commit:
-            yield batch
-            batch = []
-            rows = 0
-    if batch:
-        yield batch
+def _plan_path(src: Path) -> Path:
+    return src.with_name(src.stem + '_ordered.plan.npz')
 
 
-def _indices(batch) -> np.ndarray:
-    return np.concatenate(
-        [np.arange(start, end, dtype=np.int64) for _, start, end in batch]
-    )
+def _save_plan(path: Path, episodes: np.ndarray, lengths: np.ndarray):
+    np.savez(path, episodes=episodes.astype(np.int64), lengths=lengths.astype(np.int64))
+
+
+def _load_plan(path: Path):
+    with np.load(path) as data:
+        return data['episodes'].astype(np.int64), data['lengths'].astype(np.int64)
 
 
 def _open_writer(dst: Path, schema: pa.Schema, resume: bool):
@@ -189,26 +171,97 @@ def _open_writer(dst: Path, schema: pa.Schema, resume: bool):
     return db.create_table(dst.stem, schema=schema)
 
 
-def _verify(dest_dataset, runs, episode_idx, step_idx):
-    got_episode = _column(dest_dataset, 'episode_idx').astype(np.int64, copy=False)
-    got_step = _column(dest_dataset, 'step_idx').astype(np.int64, copy=False)
-    expect_episode = np.concatenate(
-        [episode_idx[start:end] for _, start, end in runs]
-    ).astype(np.int64, copy=False)
-    expect_step = np.concatenate(
-        [step_idx[start:end] for _, start, end in runs]
-    ).astype(np.int64, copy=False)
-    if len(got_episode) != len(expect_episode) or not np.array_equal(
-        got_episode, expect_episode
-    ):
-        raise SystemExit('Rewritten episode_idx does not match the source.')
-    if not np.array_equal(got_step, expect_step):
-        raise SystemExit('Rewritten step_idx does not match the source.')
-    if not _in_order(got_episode):
-        raise SystemExit('Rewritten table is still out of episode order.')
+def _read_runs(dataset, batch):
+    fragments = {fragment.fragment_id: fragment for fragment in dataset.get_fragments()}
+    tables = []
+    for episode, frag_id, local_start, local_end in batch:
+        fragment = fragments.get(frag_id)
+        if fragment is None:
+            raise SystemExit(
+                f'Fragment {frag_id} for episode {episode} is missing. '
+                'The source table changed.'
+            )
+        tables.append(
+            fragment.scanner(offset=local_start, limit=local_end - local_start).to_table()
+        )
+    return pa.concat_tables(tables)
 
 
-def _swap(src: Path, dst: Path):
+def _expect_episodes(batch) -> np.ndarray:
+    parts = [
+        np.full(local_end - local_start, episode, dtype=np.int64)
+        for episode, _, local_start, local_end in batch
+    ]
+    return np.concatenate(parts)
+
+
+def _drop_fragments(src: Path, drop_ids: set[int]):
+    import lance
+
+    dataset = lance.dataset(str(src))
+    keep = [
+        fragment.metadata
+        for fragment in dataset.get_fragments()
+        if fragment.fragment_id not in drop_ids
+    ]
+    operation = lance.LanceOperation.Overwrite(dataset.lance_schema, keep)
+    dataset = lance.LanceDataset.commit(str(src), operation)
+    stats = dataset.cleanup_old_versions(
+        older_than=timedelta(seconds=0),
+        delete_unverified=True,
+        error_if_tagged_old_versions=False,
+    )
+    print(f'Removed {len(drop_ids)} source fragments. {stats}')
+    return lance.dataset(str(src))
+
+
+def _dest_episode_lengths(dataset):
+    if dataset is None or dataset.count_rows() == 0:
+        return np.array([], dtype=np.int64), np.array([], dtype=np.int64)
+    episode_idx = _column(dataset, 'episode_idx').astype(np.int64, copy=False)
+    if not _in_order(episode_idx):
+        raise SystemExit(
+            'Partial rewrite is itself out of episode order. Re-run with '
+            '--overwrite only if the source still has every episode.'
+        )
+    runs = _scan_runs(episode_idx, _column(dataset, 'step_idx'))
+    episodes = np.array([episode for episode, _, _ in runs], dtype=np.int64)
+    lengths = np.array([end - start for _, start, end in runs], dtype=np.int64)
+    if len(episodes) != len(np.unique(episodes)):
+        raise SystemExit('Partial rewrite repeats an episode.')
+    return episodes, lengths
+
+
+def _check_dest_prefix(dest_episodes, dest_lengths, plan_episodes, plan_lengths):
+    count = len(dest_episodes)
+    if count == 0:
+        return
+    if not np.array_equal(dest_episodes, plan_episodes[:count]):
+        raise SystemExit(
+            'Partial rewrite is not a prefix of the planned episode order. '
+            'Re-run with --overwrite only if the source still has every episode.'
+        )
+    if not np.array_equal(dest_lengths, plan_lengths[:count]):
+        raise SystemExit(
+            'Partial rewrite episode lengths do not match the plan.'
+        )
+
+
+def _batches(runs, rows_per_commit: int):
+    batch = []
+    rows = 0
+    for run in runs:
+        batch.append(run)
+        rows += run[3] - run[2]
+        if rows >= rows_per_commit:
+            yield batch
+            batch = []
+            rows = 0
+    if batch:
+        yield batch
+
+
+def _swap(src: Path, dst: Path, plan: Path):
     backup = src.with_name(src.name + '.bak')
     if backup.exists():
         raise SystemExit(
@@ -224,21 +277,21 @@ def _swap(src: Path, dst: Path):
             f'and the rewrite is at {dst}.'
         )
         raise
+    plan.unlink(missing_ok=True)
     print(f'Replaced {src}')
-    print(f'Previous table kept at {backup}')
-    print(f'Delete it once training opens the new table: rm -rf {backup}')
+    print(f'Old manifest kept at {backup}')
+    print(f'Remove it with: rm -rf {backup}')
 
 
 def main():
     args = _parse()
     if args.rows_per_commit < 1:
         raise SystemExit('--rows-per-commit must be positive')
-    src = args.src or (
-        _datasets_dir() / 'pusht_expert_train_dino.lance'
-    )
+    src = args.src or (_datasets_dir() / 'pusht_expert_train_dino.lance')
     if not src.is_dir():
         raise SystemExit(f'Missing source table: {src}')
     dst = src.with_name(src.stem + '_ordered.lance')
+    plan_file = _plan_path(src)
     if dst.resolve() == src.resolve():
         raise SystemExit('Refusing to write the rewrite on top of the source.')
 
@@ -249,75 +302,131 @@ def main():
     for column in ('episode_idx', 'step_idx'):
         if column not in names:
             raise SystemExit(f'{src} has no {column} column')
-    episode_idx = _column(source, 'episode_idx')
-    step_idx = _column(source, 'step_idx')
-    if _in_order(episode_idx):
+
+    source_episode = _column(source, 'episode_idx') if source.count_rows() else np.array([])
+    source_step = _column(source, 'step_idx') if source.count_rows() else np.array([])
+    source_ids_now = set(int(episode) for episode in np.unique(source_episode)) if len(source_episode) else set()
+    if args.overwrite and plan_file.exists():
+        planned, _ = _load_plan(plan_file)
+        gone = [int(episode) for episode in planned if int(episode) not in source_ids_now]
+        if gone:
+            raise SystemExit(
+                '--overwrite would delete episodes that were already removed '
+                f'from the source (first id: {gone[0]}).'
+            )
+    if args.overwrite:
+        if dst.exists():
+            shutil.rmtree(dst)
+            print(f'Removed partial rewrite {dst}')
+        plan_file.unlink(missing_ok=True)
+    if source.count_rows() and _in_order(source_episode) and not dst.exists():
         print(f'{src} is already in episode order. Nothing to rewrite.')
         return
-    runs = _runs(episode_idx, step_idx)
-    n_rows = len(episode_idx)
-    print(
-        f'{src}: {len(runs)} episodes, {n_rows} rows, out of episode order. '
-        'Copying runs into episode_idx order.'
-    )
 
-    if args.overwrite and dst.exists():
-        shutil.rmtree(dst)
-        print(f'Removed partial rewrite {dst}')
+    scan_runs = _scan_runs(source_episode, source_step)
+    located, frag_episodes = _locate(scan_runs, _fragment_bounds(source))
+    source_ids = np.array([episode for episode, _, _, _ in located], dtype=np.int64)
 
-    resume = dst.exists()
-    dest_dataset = lance.dataset(str(dst)) if resume else None
-    done_rows = _prefix_length(dest_dataset, runs, step_idx)
-    start_at = 0
-    counted = 0
-    for index, (_, start, end) in enumerate(runs):
-        if counted == done_rows:
-            start_at = index
-            break
-        counted += end - start
+    dest_dataset = lance.dataset(str(dst)) if dst.exists() else None
+    dest_episodes, dest_lengths = _dest_episode_lengths(dest_dataset)
+
+    if plan_file.exists():
+        plan_episodes, plan_lengths = _load_plan(plan_file)
     else:
-        start_at = len(runs)
-    if done_rows:
-        print(f'Resuming at row {done_rows} ({start_at}/{len(runs)} episodes).')
-
-    if start_at < len(runs):
-        src_bytes = _dir_bytes(src)
-        dst_bytes = _dir_bytes(dst) if dst.exists() else 0
-        need = max(src_bytes - dst_bytes, 0)
-        free = shutil.disk_usage(src.parent).free
-        print(
-            f'Source is {src_bytes / 1e9:.1f} GB. Need about '
-            f'{need / 1e9:.1f} GB free for the copy; {free / 1e9:.1f} GB free.'
-        )
-        if free < need + (1 << 30):
+        if len(dest_episodes) and len(np.intersect1d(dest_episodes, source_ids)):
             raise SystemExit(
-                'Not enough free disk to write the reordered copy next to '
-                'the source. Free space, then re-run. The original table is '
-                'unchanged.'
+                'A partial rewrite exists but its plan file does not. '
+                'Re-run with --overwrite if the source still has every episode.'
             )
-        writer = None
-        started = time.perf_counter()
-        written_now = 0
-        for batch in _batches(runs[start_at:], args.rows_per_commit):
-            taken = source.take(_indices(batch).tolist())
-            if writer is None:
-                writer = _open_writer(dst, taken.schema, resume)
-                resume = True
-            writer.add(taken, write_parallelism=1)
-            n_batch = taken.num_rows
-            done_rows += n_batch
-            written_now += n_batch
-            elapsed = max(time.perf_counter() - started, 1e-6)
-            print(
-                f'rows {done_rows}/{n_rows}  '
-                f'{written_now / elapsed:.0f} rows/s'
+        by_id = {episode: local_end - local_start for episode, _, local_start, local_end in located}
+        for episode, length in zip(dest_episodes, dest_lengths):
+            by_id.setdefault(int(episode), int(length))
+        plan_episodes = np.array(sorted(by_id), dtype=np.int64)
+        plan_lengths = np.array([by_id[int(episode)] for episode in plan_episodes], dtype=np.int64)
+        _save_plan(plan_file, plan_episodes, plan_lengths)
+
+    _check_dest_prefix(dest_episodes, dest_lengths, plan_episodes, plan_lengths)
+    copied = set(int(episode) for episode in dest_episodes)
+    missing = [int(episode) for episode in plan_episodes if int(episode) not in copied and int(episode) not in set(source_ids.tolist())]
+    if missing:
+        raise SystemExit(
+            f'{len(missing)} episodes are in neither the source nor the '
+            f'partial rewrite (first missing id: {missing[0]}).'
+        )
+    remaining = [run for run in located if run[0] not in copied]
+    n_rows = int(plan_lengths.sum())
+    done_rows = int(dest_lengths.sum()) if len(dest_lengths) else 0
+    print(
+        f'{src}: {len(plan_episodes)} episodes, {n_rows} rows. '
+        f'{len(copied)} episodes already copied. '
+        'Source fragments are deleted once their episodes are in the new table.'
+    )
+    if done_rows:
+        print(f'Resuming at row {done_rows}.')
+
+    writer = None
+    resume = dest_dataset is not None and done_rows > 0
+    started = time.perf_counter()
+    written_now = 0
+    src_bytes = _dir_bytes(src)
+    bytes_per_row = src_bytes / max(int(source.count_rows()), 1)
+    ready = {
+        frag_id
+        for frag_id, episodes in frag_episodes.items()
+        if episodes and episodes <= copied
+    }
+    if ready:
+        _drop_fragments(src, ready)
+        for frag_id in ready:
+            del frag_episodes[frag_id]
+
+    for batch in _batches(remaining, args.rows_per_commit):
+        batch_rows = sum(local_end - local_start for _, _, local_start, local_end in batch)
+        free = shutil.disk_usage(src.parent).free
+        need = int(batch_rows * bytes_per_row * 1.5) + (1 << 30)
+        if free < need:
+            raise SystemExit(
+                f'Need about {need / 1e9:.1f} GB free for the next '
+                f'{batch_rows} rows; {free / 1e9:.1f} GB free. '
+                f'{done_rows} rows are already in the new table. Re-run to continue.'
             )
-            del taken
+        source = lance.dataset(str(src))
+        taken = _read_runs(source, batch)
+        got = taken.column('episode_idx').to_numpy()
+        if not np.array_equal(got.astype(np.int64, copy=False), _expect_episodes(batch)):
+            raise SystemExit('Copied rows are not the expected episodes.')
+        if writer is None:
+            writer = _open_writer(dst, taken.schema, resume)
+            resume = True
+        writer.add(taken, write_parallelism=1)
+        done_rows += taken.num_rows
+        written_now += taken.num_rows
+        copied.update(episode for episode, _, _, _ in batch)
+        del taken
+        ready = {
+            frag_id
+            for frag_id, episodes in frag_episodes.items()
+            if episodes and episodes <= copied
+        }
+        if ready:
+            _drop_fragments(src, ready)
+            for frag_id in ready:
+                del frag_episodes[frag_id]
+        elapsed = max(time.perf_counter() - started, 1e-6)
+        print(
+            f'rows {done_rows}/{n_rows}  '
+            f'{written_now / elapsed:.0f} rows/s  '
+            f'{shutil.disk_usage(src.parent).free / 1e9:.1f} GB free'
+        )
 
     rewritten = lance.dataset(str(dst))
-    _verify(rewritten, runs, episode_idx, step_idx)
+    got_episodes, got_lengths = _dest_episode_lengths(rewritten)
+    if not np.array_equal(got_episodes, plan_episodes) or not np.array_equal(
+        got_lengths, plan_lengths
+    ):
+        raise SystemExit('Rewritten table does not match the episode plan.')
     print(f'Verified {rewritten.count_rows()} rows in episode order.')
-    _swap(src, dst)
+    _swap(src, dst, plan_file)
 
 
 if __name__ == '__main__':
