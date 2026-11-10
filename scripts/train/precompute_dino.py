@@ -309,10 +309,12 @@ def _flush(dst_db, dst_stem, held_tables, held_tokens, metadata, dest):
     table = _with_dino(pa.concat_tables(held_tables), tokens, metadata)
     if table.num_rows != tokens.shape[0]:
         raise RuntimeError('DINO rows do not match the copied frame rows.')
+    # Default parallelism round-robins Arrow row groups (one per episode
+    # here) into separate fragments, so a scan of episode_idx decreases.
+    # One writer keeps the source order.
     if dest is None:
-        dest = dst_db.create_table(dst_stem, table)
-    else:
-        dest.add(table)
+        dest = dst_db.create_table(dst_stem, schema=table.schema)
+    dest.add(table, write_parallelism=1)
     held_tables.clear()
     held_tokens.clear()
     return dest
@@ -517,11 +519,17 @@ def main():
     if dest is None and dst_stem in _table_names(dst_db):
         dest = dst_db.open_table(dst_stem)
     if dest is not None:
-        got = len(_episode_ids(dest))
+        got_ids = _episode_ids(dest)
+        got = len(got_ids)
         print(f'Wrote {dst_path}: {got} rows, {len(spans)} episodes requested.')
         if args.limit_episodes is None and got != len(episode_idx):
             raise SystemExit(
                 f'Destination has {got} rows, source has {len(episode_idx)}.'
+            )
+        if len(got_ids) > 1 and (np.diff(got_ids.astype(np.int64)) < 0).any():
+            raise SystemExit(
+                'Destination episode_idx decreases. The Lance write did not '
+                'keep source order.'
             )
 
     command = _upload_command(dst_path, args.upload or DEFAULT_REPO)

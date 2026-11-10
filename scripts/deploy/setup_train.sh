@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Bootstrap a RunPod image for DINO-WM or MoPWM training.
-# Usage: setup_train.sh [pusht|tworoom]
+# Usage: setup_train.sh [pusht|tworoom] [--original-pusht]
+# pusht downloads the precomputed DINOv2 Lance table. --original-pusht
+# downloads the JPEG PushT set instead.
 # Torch and CUDA are already in the image Python; this script does not replace them.
 # HF_TOKEN must already be set. Training is not started; the command is printed.
 #
@@ -12,14 +14,26 @@
 #   git -C ../stable-worldmodel diff --no-index -- /dev/null tests/test_visual_perturbation.py >> patches/stable-worldmodel.patch
 set -euo pipefail
 
-TASK="${1:-pusht}"
-case "${TASK}" in
-  pusht|tworoom) ;;
-  *)
-    echo "Usage: $0 [pusht|tworoom]" >&2
-    exit 1
-    ;;
-esac
+TASK="pusht"
+ORIGINAL_PUSHT=0
+for arg in "$@"; do
+  case "${arg}" in
+    pusht|tworoom)
+      TASK="${arg}"
+      ;;
+    --original-pusht)
+      ORIGINAL_PUSHT=1
+      ;;
+    *)
+      echo "Usage: $0 [pusht|tworoom] [--original-pusht]" >&2
+      exit 1
+      ;;
+  esac
+done
+if [[ "${ORIGINAL_PUSHT}" -eq 1 && "${TASK}" != pusht ]]; then
+  echo "--original-pusht applies only to the pusht task." >&2
+  exit 1
+fi
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 STABLEWM_HOME="/workspace/.stablewm"
@@ -177,12 +191,20 @@ if [[ -z "${HF_BIN}" ]]; then
 fi
 
 if [[ "${TASK}" == pusht ]]; then
-  DATASET_PATH="${DATASET_DIR}/pusht_expert_train.lance"
-  echo "Downloading PushT to ${DATASET_PATH}"
+  if [[ "${ORIGINAL_PUSHT}" -eq 1 ]]; then
+    DATASET_PATH="${DATASET_DIR}/pusht_expert_train.lance"
+    DATASET_REPO="galilai-group/lewm-pusht"
+    DATASET_REMOTE="pusht_expert_train.lance/"
+  else
+    DATASET_PATH="${DATASET_DIR}/pusht_expert_train_dino.lance"
+    DATASET_REPO="flamma77/pusht_expert_train_dino"
+    DATASET_REMOTE="pusht_expert_train_dino.lance/"
+  fi
+  echo "Downloading ${DATASET_REMOTE} from ${DATASET_REPO} to ${DATASET_PATH}"
   if [[ -d "${DATASET_PATH}" ]] && [[ -n "$(ls -A "${DATASET_PATH}")" ]]; then
     echo "Already present: ${DATASET_PATH}"
   else
-    "${HF_BIN}" download galilai-group/lewm-pusht pusht_expert_train.lance/ \
+    "${HF_BIN}" download "${DATASET_REPO}" "${DATASET_REMOTE}" \
       --repo-type dataset \
       --local-dir "${DATASET_DIR}" \
       --token "${HF_TOKEN}"
@@ -218,11 +240,18 @@ ENV_PREFIX="SDL_VIDEODRIVER=dummy HF_HOME=${HF_HOME} STABLEWM_HOME=${STABLEWM_HO
 echo
 echo "Use this interpreter. uv run creates .venv and reinstalls the lockfile, including another torch."
 if [[ "${TASK}" == pusht ]]; then
-  echo "Start DINO-WM training with:"
-  echo "${ENV_PREFIX} ${PY} ${ROOT}/scripts/train/dinowm.py data=pusht output_model_name=dinowm-pusht"
-  echo
-  echo "MoPWM:"
-  echo "${ENV_PREFIX} ${PY} ${ROOT}/scripts/train/mopwm.py data=pusht output_model_name=${RUN_NAME}"
+  if [[ "${ORIGINAL_PUSHT}" -eq 1 ]]; then
+    echo "Start DINO-WM training with:"
+    echo "${ENV_PREFIX} ${PY} ${ROOT}/scripts/train/dinowm.py data=pusht output_model_name=dinowm-pusht"
+    echo
+    echo "MoPWM:"
+    echo "${ENV_PREFIX} ${PY} ${ROOT}/scripts/train/mopwm.py data=pusht output_model_name=${RUN_NAME}"
+  else
+    echo "Start DINO-WM training with:"
+    echo "${ENV_PREFIX} ${PY} ${ROOT}/scripts/train/dinowm.py data=pusht_dino output_model_name=dinowm-pusht"
+    echo
+    echo "MoPWM needs the JPEG set: $0 pusht --original-pusht"
+  fi
 else
   echo "Start training with:"
   echo "${ENV_PREFIX} ${PY} ${ROOT}/scripts/train/mopwm.py data=${TASK} output_model_name=${RUN_NAME}"
