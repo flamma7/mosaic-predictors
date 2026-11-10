@@ -42,6 +42,9 @@ def get_img_preprocessor(
 
 
 CONFIG_YAML = 'config.yaml'
+# DINOv2 sequence written by precompute_dino.py. One fp16 row per frame:
+# CLS, then the patch grid, flattened. Training drops the CLS token.
+DINO_COLUMN = 'dino'
 
 
 def _hf_path_prefix(hf_cfg, run_name):
@@ -166,6 +169,74 @@ def _strip_action_dims(tensor, action_range):
     return torch.cat([tensor[..., :lo], tensor[..., hi:]], dim=-1)
 
 
+def _resolve_cached_dino(cfg):
+    """Whether the training forward reads precomputed patch tokens.
+
+    ``cached_dino: null`` follows the dataset: on when ``dino`` is loaded.
+    Simulator frames and perturbed clips still go through the encoder.
+    """
+    loaded = DINO_COLUMN in list(cfg.data.dataset.keys_to_load)
+    flag = cfg.get('cached_dino')
+    if flag is None:
+        return loaded
+    flag = bool(flag)
+    keys = list(cfg.data.dataset.keys_to_load)
+    if flag and DINO_COLUMN not in keys:
+        raise ValueError(
+            'cached_dino=true needs `dino` in data.dataset.keys_to_load'
+        )
+    if not flag and loaded and 'pixels' not in keys:
+        raise ValueError(
+            'cached_dino=false needs `pixels` in keys_to_load to encode frames'
+        )
+    return flag
+
+
+def _patches_from_cache(tokens, num_patches, embed_dim):
+    """Drop the leading CLS token. The cache stores ``[CLS, patches]``."""
+    n_tokens = num_patches + 1
+    if tokens.ndim == 3:
+        flat = tokens.shape[-1]
+        expect = n_tokens * embed_dim
+        if flat != expect:
+            raise ValueError(
+                f'Cached dino row is {flat} values, expected {expect} '
+                f'(CLS + {num_patches} patches x {embed_dim})'
+            )
+        tokens = tokens.reshape(*tokens.shape[:2], n_tokens, embed_dim)
+    elif tokens.ndim != 4 or tokens.shape[-2:] != (n_tokens, embed_dim):
+        raise ValueError(
+            'Cached dino tensor must be (B, T, 1+P, D) or (B, T, (1+P)*D), '
+            f'got {tuple(tokens.shape)}'
+        )
+    return tokens[..., 1:, :]
+
+
+def _embedding_from_cache(model, batch, cfg):
+    """Build the predictor input from cached DINOv2 tokens.
+
+    The cache stores the CLS token and the patch grid. The predictor is
+    trained on the patches, so the CLS token is dropped here. Action and
+    proprio embeddings are still computed; they are trained, and the cache
+    does not include them.
+    """
+    num_patches = (cfg.encoder_img_size // cfg.patch_size) ** 2
+    tokens = _patches_from_cache(
+        batch[DINO_COLUMN], num_patches, int(cfg.patch_embed_dim)
+    )
+    pixels_emb = tokens.detach().float()
+    n_patches = pixels_emb.shape[2]
+    embedding = pixels_emb
+    info = {'pixels_emb': pixels_emb}
+    for key, encoder in model.extra_encoders.items():
+        extra = encoder(batch[key].float())
+        info[f'{key}_emb'] = extra
+        tiled = extra.unsqueeze(2).expand(-1, -1, n_patches, -1)
+        embedding = torch.cat([embedding, tiled], dim=-1)
+    info['emb'] = embedding
+    return info
+
+
 def dinowm_forward(self, batch, stage, cfg):
     """Teacher-forced latent MSE on frozen DINOv2 features.
 
@@ -176,7 +247,10 @@ def dinowm_forward(self, batch, stage, cfg):
     for key in self.model.extra_encoders:
         batch[key] = torch.nan_to_num(batch[key], 0.0)
 
-    output = self.model.encode(batch, target='emb', is_video=False)
+    if cfg.cached_dino:
+        output = _embedding_from_cache(self.model, batch, cfg)
+    else:
+        output = self.model.encode(batch, target='emb', is_video=False)
 
     ctx_emb = output['emb'][:, : cfg.wm.history_size]
     pred_emb = self.model.predict(ctx_emb)
@@ -247,11 +321,15 @@ def run(cfg):
         image_size=cfg.img_size,
         encoder_image_size=cfg.encoder_img_size,
     )
+    use_cache = _resolve_cached_dino(cfg)
     column_transforms = []
 
     with open_dict(cfg):
+        cfg.cached_dino = use_cache
         for col in cfg.data.dataset.keys_to_load:
-            if col.startswith('pixels'):
+            # `dino` is the frozen patch grid. Fitting a scaler would read
+            # the whole column (hundreds of GB) and then rescale the target.
+            if col.startswith('pixels') or col == DINO_COLUMN:
                 continue
 
             normalizer = get_column_normalizer(dataset, col, col)
@@ -269,10 +347,17 @@ def run(cfg):
             del cfg.model.extra_encoders.modules['proprio']
 
     column_transform = spt.data.transforms.Compose(*column_transforms)
-    transform = spt.data.transforms.Compose(
-        image_preprocess, *column_transforms
-    )
-    dataset.transform = transform
+    if use_cache:
+        # No pixels in this loader. Perturbed MSE opens a second reader.
+        dataset.transform = column_transform
+        print(
+            'Training on cached DINOv2 patch tokens. '
+            'MPC and perturbed clips still run the encoder.'
+        )
+    else:
+        dataset.transform = spt.data.transforms.Compose(
+            image_preprocess, *column_transforms
+        )
 
     rnd_gen = torch.Generator().manual_seed(cfg.seed)
     train_set, val_set = spt.data.random_split(
@@ -401,6 +486,21 @@ def run(cfg):
     ]
     extra = cfg.get('validate_extra')
     if extra is not None and extra.get('enabled', False):
+        frames_dataset = None
+        mse_on = bool(extra.get('mse', {}).get('enabled', True))
+        if use_cache and mse_on and 'pixels' not in dataset.column_names:
+            frames_dataset = swm.data.load_dataset(
+                dataset_name,
+                cache_dir=cache_dir,
+                num_steps=int(dataset.num_steps),
+                frameskip=int(dataset.frameskip),
+                keys_to_load=['pixels', 'action', 'proprio', 'state'],
+            )
+            if frames_dataset.lengths.tolist() != dataset.lengths.tolist():
+                raise RuntimeError(
+                    'Pixel rows and cached DINO rows have different '
+                    'episode lengths, so the train split would not match.'
+                )
         callbacks.append(
             ExtraValidationCallback(
                 cfg=cfg,
@@ -410,6 +510,7 @@ def run(cfg):
                 column_transform=column_transform,
                 cache_dir=cache_dir,
                 dataset_name=dataset_name,
+                frames_dataset=frames_dataset,
             )
         )
 

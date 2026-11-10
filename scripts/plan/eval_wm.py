@@ -20,6 +20,17 @@ from torchvision.transforms import v2 as transforms
 import stable_worldmodel as swm
 
 
+def _history_keys(model):
+    """Keys stacked over the same context frames as pixels.
+
+    PreJEPA concatenates each non-action extra encoder onto the patch
+    tokens, so those inputs must share the pixel time axis. Action blocks
+    travel separately as ``action_history``.
+    """
+    extras = getattr(model, 'extra_encoders', None) or {}
+    return ('pixels', *(key for key in extras if key != 'action'))
+
+
 def configure_visuals(cfg):
     """AdaJEPA visual shifts for PushT.
 
@@ -185,7 +196,11 @@ def run(cfg: DictConfig):
         cost = swm.planning.ShootingCostEvaluator(model, objective)
         solver = hydra.utils.instantiate(cfg.solver, cost=cost)
         policy = swm.policy.WorldModelPolicy(
-            solver=solver, config=config, process=process, transform=transform
+            solver=solver,
+            config=config,
+            process=process,
+            transform=transform,
+            history_keys=_history_keys(model),
         )
 
     else:

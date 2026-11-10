@@ -318,6 +318,17 @@ def _report(pl_module, metrics):
     )
 
 
+def _history_keys(model):
+    """Keys stacked over the same context frames as pixels.
+
+    PreJEPA concatenates each non-action extra encoder onto the patch
+    tokens, so those inputs must share the pixel time axis. Action blocks
+    travel separately as ``action_history``.
+    """
+    extras = getattr(model, 'extra_encoders', None) or {}
+    return ('pixels', *(key for key in extras if key != 'action'))
+
+
 def _planning_objective(use_proprio):
     """Score the perturbed goal encoding, source by source.
 
@@ -386,10 +397,17 @@ class ExtraValidationCallback(Callback):
         column_transform,
         cache_dir,
         dataset_name,
+        frames_dataset=None,
     ):
         super().__init__()
         self.cfg = cfg
         self.dataset = dataset
+        # Perturbed open-loop MSE re-encodes pixels. When training reads
+        # cached tokens, this is a second view of the same Lance table
+        # that still loads `pixels`. Episode order matches `dataset`.
+        self.frames_dataset = (
+            dataset if frames_dataset is None else frames_dataset
+        )
         self.image_preprocess = image_preprocess
         self.column_transform = column_transform
         self.cache_dir = cache_dir
@@ -464,13 +482,14 @@ class ExtraValidationCallback(Callback):
     def _run_mse(self, pl_module, model):
         device = next(model.parameters()).device
         use_autocast = self.bf16 and device.type == 'cuda'
-        previous = self.dataset.transform
-        self.dataset.transform = self.column_transform
+        frames = self.frames_dataset
+        previous = frames.transform
+        frames.transform = self.column_transform
         metrics = {}
         try:
             for name, spec in self.perturbations:
                 windows = _RolloutWindows(
-                    self.dataset,
+                    frames,
                     self.windows,
                     self.clip_steps,
                     self.image_preprocess,
@@ -529,7 +548,7 @@ class ExtraValidationCallback(Callback):
                         totals[horizon] / count
                     )
         finally:
-            self.dataset.transform = previous
+            frames.transform = previous
         _report(pl_module, metrics)
 
     def _run_mpc(self, pl_module, model):
@@ -679,6 +698,7 @@ class ExtraValidationCallback(Callback):
                 config=config,
                 process=ready['process'],
                 transform=ready['transform'],
+                history_keys=_history_keys(model),
             )
             world.set_policy(policy)
             device_type = ready['device'].type

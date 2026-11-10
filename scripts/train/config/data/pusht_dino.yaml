@@ -1,0 +1,18 @@
+dataset:
+  num_steps: ${eval:'${wm.num_preds} + ${wm.history_size}'}
+  frameskip: 5
+  # Same episode order as pusht_expert_train.lance. That file has no
+  # split column; dinowm's seeded random_split is unchanged.
+  name: pusht_expert_train_dino.lance
+  # `dino` replaces pixels in the training loader. The pixels column is
+  # still in the file; perturbed MSE opens a second reader for it.
+  # Do not add `dino` to keys_to_cache: that column is hundreds of GB.
+  keys_to_load:
+    - dino
+    - action
+    - proprio
+    - state
+  keys_to_cache:
+    - action
+    - proprio
+    - state

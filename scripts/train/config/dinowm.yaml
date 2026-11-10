@@ -21,6 +21,10 @@ action_emb_dim: 10
 use_proprio: true
 proprio_emb_dim: 10
 dump_object: True
+# null follows the dataset: on when `dino` is in keys_to_load
+# (`data=pusht_dino`), off for the JPEG dataset. MPC and the perturbed
+# open-loop MSE still run DINOv2 on live or corrupted frames.
+cached_dino: null
 
 trainer:
   max_epochs: 10 #100
