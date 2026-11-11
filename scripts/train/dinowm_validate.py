@@ -1,6 +1,7 @@
-"""Extra DINO-WM validation: perturbed MPC success and open-loop latent MSE.
+"""Extra validation: perturbed MPC success and open-loop latent MSE.
 
-Logged next to the regular ``val/*`` metrics:
+Used by DINO-WM and LeWM. Logged next to the regular ``val/*`` metrics.
+Train, val, MSE, and MPC all read the dataset named in the run config.
 
 * ``validate_mpc/<perturbation>`` — planning success rate (percent) on that
   visual shift. The env re-renders the observation and the goal with the
@@ -9,9 +10,10 @@ Logged next to the regular ``val/*`` metrics:
 * ``validate_mse_<horizon>/<perturbation>`` — open-loop latent MSE at that
   model step. Clips come from the validation split and are long enough for
   ``history_size`` context frames plus ``pred_length`` steps. Each step runs
-  the same history window as training, writes the dataset action into the
-  predicted frame, and scores the prediction against the encoding of the
-  perturbed frame at that step.
+  the same history window as training and scores the prediction against the
+  encoding of the perturbed frame at that step. DINO-WM writes the dataset
+  action into the predicted frame and strips those channels from the score.
+  LeWM keeps that action beside the latent.
 """
 
 from __future__ import annotations
@@ -225,6 +227,73 @@ def rollout_horizon_mse(model, batch, history_size, num_preds, horizons):
         )[0]
         z = torch.cat([z, pred], dim=1)
     return errors
+
+
+def rollout_horizon_mse_flat(model, batch, history_size, num_preds, horizons):
+    """Open-loop MSE for a flat latent (LeWM).
+
+    Actions stay a separate stream. Step ``h`` scores the last token of
+    ``predict`` on the trailing history window against the encoded frame
+    ``target_index(history_size, num_preds, h)``. The dataset action
+    embedding at that frame is what the next window conditions on.
+    """
+    batch['action'] = torch.nan_to_num(batch['action'], 0.0)
+    encoded = model.encode(batch)
+    emb = encoded['emb']
+    act = encoded['act_emb']
+    z = emb[:, :history_size]
+    a = act[:, :history_size]
+    wanted = set(int(h) for h in horizons)
+    errors = {}
+
+    for step in range(1, max(wanted) + 1):
+        pred = model.predict(z[:, -history_size:], a[:, -history_size:])
+        pred = pred[:, -1:]
+        index = target_index(history_size, num_preds, step)
+        if index >= emb.shape[1] or index >= act.shape[1]:
+            break
+        if step in wanted:
+            errors[step] = F.mse_loss(pred, emb[:, index : index + 1])
+        z = torch.cat([z, pred], dim=1)
+        a = torch.cat([a, act[:, index : index + 1]], dim=1)
+    return errors
+
+
+def _split_latent(model):
+    """True when the latent fuses extra sources (DINO-WM / PreJEPA)."""
+    return bool(getattr(model, 'extra_encoders', None))
+
+
+def _rollout_mse(model, batch, history_size, num_preds, horizons):
+    if _split_latent(model):
+        return rollout_horizon_mse(
+            model, batch, history_size, num_preds, horizons
+        )
+    return rollout_horizon_mse_flat(
+        model, batch, history_size, num_preds, horizons
+    )
+
+
+def _mpc_objective(model, cfg):
+    """Split latents score each source. A flat latent uses GoalMSE."""
+    if _split_latent(model):
+        return _planning_objective(bool(cfg.use_proprio))
+    return GoalMSE()
+
+
+def _loader_batch_size(cfg):
+    loader = cfg.get('val_loader', None)
+    if loader is None:
+        loader = cfg.loader
+    return int(loader.batch_size)
+
+
+def _encoder_image_size(cfg):
+    """Second resize for DINO-WM. LeWM encodes at ``img_size``."""
+    size = cfg.get('encoder_img_size', None)
+    if size is None:
+        return int(cfg.img_size)
+    return int(size)
 
 
 class _RolloutWindows(torch.utils.data.Dataset):
@@ -498,7 +567,7 @@ class ExtraValidationCallback(Callback):
                     self.seed,
                 )
                 batch_size = min(
-                    int(self.cfg.val_loader.batch_size), len(windows)
+                    _loader_batch_size(self.cfg), len(windows)
                 )
                 loader = torch.utils.data.DataLoader(
                     windows,
@@ -523,7 +592,7 @@ class ExtraValidationCallback(Callback):
                         dtype=torch.bfloat16,
                         enabled=use_autocast,
                     ):
-                        errors = rollout_horizon_mse(
+                        errors = _rollout_mse(
                             model,
                             batch,
                             self.history_size,
@@ -624,7 +693,7 @@ class ExtraValidationCallback(Callback):
         )
         device = next(model.parameters()).device
         transform = _image_transform(
-            self.cfg.img_size, self.cfg.encoder_img_size
+            self.cfg.img_size, _encoder_image_size(self.cfg)
         )
         return {
             'num_eval': num_eval,
@@ -675,7 +744,7 @@ class ExtraValidationCallback(Callback):
             extra_wrappers=wrappers,
         )
         try:
-            objective = _planning_objective(bool(self.cfg.use_proprio))
+            objective = _mpc_objective(model, self.cfg)
             cost = ShootingCostEvaluator(model, objective)
             solver = CEMSolver(
                 cost=cost,

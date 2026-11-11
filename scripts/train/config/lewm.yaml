@@ -43,6 +43,62 @@ wm:
   history_size: 3
   num_preds: 1
 
+# After each validation epoch, on the weights just saved. The regular
+# val/* loss is unchanged. Success rates are percents. MSE is the latent
+# error against the perturbed encoding. The dataset action at the scored
+# frame conditions the next step; it is not part of the latent.
+# Train, val, MSE, and MPC all read data.dataset (config/data/pusht.yaml).
+# Set a perturbation's enabled flag to false to drop it from both logs.
+validate_extra:
+  enabled: true
+  every_n_epochs: 1
+  mse:
+    enabled: true
+    # Model steps rolled out after the history window. Clips are
+    # history_size + pred_length frames from the validation split.
+    pred_length: 25
+    horizons: [1, 5, 10, 15, 25]
+    # null scores every validation clip long enough for the rollout.
+    num_samples: 64
+  mpc:
+    enabled: true
+    num_eval: 25
+    seed: ${seed}
+    goal_offset_steps: 25
+    eval_budget: 50
+    horizon: 5
+    receding_horizon: 5
+    action_block: ${data.dataset.frameskip}
+    num_samples: 300
+    n_steps: 30
+    topk: 30
+    var_scale: 1.0
+    env_name: swm/PushT-v1
+  perturbations:
+    none:
+      enabled: true
+    blur:
+      enabled: true
+      blur: true
+    snp1:
+      enabled: true
+      salt_pepper: true
+    snp5:
+      enabled: true
+      salt_pepper: 0.05
+    dark:
+      enabled: true
+      dark: 0.7
+    red-agent:
+      enabled: true
+      agent_color: red
+    red-block:
+      enabled: true
+      block_color: red
+    red-anchor:
+      enabled: true
+      anchor_color: red
+
 model:
   _target_: stable_worldmodel.wm.lewm.LeWM
   encoder:

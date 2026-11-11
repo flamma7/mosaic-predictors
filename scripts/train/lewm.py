@@ -15,6 +15,7 @@ from stable_worldmodel.data import column_normalizer as get_column_normalizer
 from stable_worldmodel.wm.loss import SIGReg
 from lightning.pytorch.callbacks import Callback
 from stable_worldmodel.wm.utils import save_pretrained
+from dinowm_validate import ExtraValidationCallback
 from sigreg_diagnostics import SIGRegCollapseMonitor
 
 
@@ -205,11 +206,13 @@ def run(cfg):
     dataset = swm.data.load_dataset(
         dataset_name, transform=None, cache_dir=cache_dir, **dataset_cfg
     )
-    transforms = [
-        get_img_preprocessor(
-            source='pixels', target='pixels', img_size=cfg.img_size
-        )
-    ]
+    # ImageNet norm and resize stay off the column transform. Perturbed
+    # MSE applies them after the uint8 shift, on the same pixels the
+    # train and val loaders encode.
+    image_preprocess = get_img_preprocessor(
+        source='pixels', target='pixels', img_size=cfg.img_size
+    )
+    column_transforms = []
 
     with open_dict(cfg):
         for col in cfg.data.dataset.keys_to_load:
@@ -217,14 +220,16 @@ def run(cfg):
                 continue
 
             normalizer = get_column_normalizer(dataset, col, col)
-            transforms.append(normalizer)
+            column_transforms.append(normalizer)
 
         cfg.model.action_encoder.input_dim = (
             cfg.data.dataset.frameskip * dataset.get_dim('action')
         )
 
-    transform = spt.data.transforms.Compose(*transforms)
-    dataset.transform = transform
+    column_transform = spt.data.transforms.Compose(*column_transforms)
+    dataset.transform = spt.data.transforms.Compose(
+        image_preprocess, *column_transforms
+    )
 
     rnd_gen = torch.Generator().manual_seed(cfg.seed)
     train_set, val_set = spt.data.random_split(
@@ -309,6 +314,20 @@ def run(cfg):
     callbacks = [save_ckpt_callback]
     if getattr(world_model, 'sigreg_diagnostics', None) is not None:
         callbacks.append(_SigregDiagClose())
+
+    extra = cfg.get('validate_extra')
+    if extra is not None and extra.get('enabled', False):
+        callbacks.append(
+            ExtraValidationCallback(
+                cfg=cfg,
+                dataset=dataset,
+                val_indices=list(val_set.indices),
+                image_preprocess=image_preprocess,
+                column_transform=column_transform,
+                cache_dir=cache_dir,
+                dataset_name=dataset_name,
+            )
+        )
 
     trainer = pl.Trainer(
         **cfg.trainer,
