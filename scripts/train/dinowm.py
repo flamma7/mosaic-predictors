@@ -15,7 +15,7 @@ from stable_worldmodel.data import column_normalizer as get_column_normalizer
 from stable_worldmodel.wm.utils import save_pretrained
 from torch.nn import functional as F
 
-from dinowm_validate import ExtraValidationCallback
+from validate_extra import ExtraValidationCallback
 
 
 def get_img_preprocessor(

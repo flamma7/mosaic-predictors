@@ -15,7 +15,7 @@ from stable_worldmodel.data import column_normalizer as get_column_normalizer
 from stable_worldmodel.wm.loss import SIGReg
 from lightning.pytorch.callbacks import Callback
 from stable_worldmodel.wm.utils import save_pretrained
-from dinowm_validate import ExtraValidationCallback
+from validate_extra import ExtraValidationCallback
 from sigreg_diagnostics import SIGRegCollapseMonitor
 
 
