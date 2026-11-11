@@ -13,6 +13,12 @@ img_size: 224
 patch_size: 14
 encoder_scale: tiny
 embed_dim: 192
+# Concatenate a proprio embedding onto the CLS latent and include it in
+# the prediction target. DINO-WM repeats that vector across patches; LeWM
+# has one token, so it is concatenated once. The predictor width becomes
+# embed_dim + proprio_emb_dim. Actions stay beside the latent.
+use_proprio: true
+proprio_emb_dim: 10
 encoder_resnet9: False
 train_value_function: False
 projector_loss_weight: 1e-3
@@ -54,8 +60,9 @@ wm:
 
 # After each validation epoch, on the weights just saved. The regular
 # val/* loss is unchanged. Success rates are percents. MSE is the latent
-# error against the perturbed encoding. The dataset action at the scored
-# frame conditions the next step; it is not part of the latent.
+# error against the perturbed encoding. Proprio, when enabled, is part of
+# that latent. The dataset action at the scored frame conditions the next
+# step; it is not part of the latent.
 # Train, val, MSE, and MPC all read data.dataset (config/data/pusht.yaml).
 # Set a perturbation's enabled flag to false to drop it from both logs.
 validate_extra:
@@ -133,6 +140,10 @@ model:
     _target_: stable_worldmodel.wm.lewm.module.Embedder
     input_dim: ???
     emb_dim: ${embed_dim}
+  proprio_encoder:
+    _target_: stable_worldmodel.wm.lewm.module.Embedder
+    input_dim: ???
+    emb_dim: ${proprio_emb_dim}
   projector:
     _target_: stable_worldmodel.wm.lewm.module.MLP
     input_dim: ${embed_dim}

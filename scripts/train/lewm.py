@@ -225,6 +225,28 @@ def run(cfg):
         cfg.model.action_encoder.input_dim = (
             cfg.data.dataset.frameskip * dataset.get_dim('action')
         )
+        # Proprio is one vector per step, not a frameskip block. It is
+        # concatenated onto the CLS latent, so the predictor and the
+        # prediction projector widen by proprio_emb_dim.
+        if cfg.use_proprio:
+            if 'proprio' not in list(cfg.data.dataset.keys_to_load):
+                raise ValueError(
+                    'use_proprio=true needs proprio in '
+                    'data.dataset.keys_to_load'
+                )
+            cfg.model.proprio_encoder.input_dim = dataset.get_dim('proprio')
+            fused = int(cfg.embed_dim) + int(cfg.proprio_emb_dim)
+            cfg.model.predictor.input_dim = fused
+            cfg.model.predictor.hidden_dim = fused
+            cfg.model.predictor.output_dim = fused
+            cfg.model.pred_proj.input_dim = fused
+            cfg.model.pred_proj.output_dim = fused
+            print(
+                f'Proprio on: {cfg.proprio_emb_dim}-d embedding '
+                f'concatenated onto the {cfg.embed_dim}-d CLS latent'
+            )
+        else:
+            del cfg.model.proprio_encoder
 
     column_transform = spt.data.transforms.Compose(*column_transforms)
     dataset.transform = spt.data.transforms.Compose(

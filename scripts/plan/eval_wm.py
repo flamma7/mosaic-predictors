@@ -24,11 +24,18 @@ def _history_keys(model):
     """Keys stacked over the same context frames as pixels.
 
     PreJEPA concatenates each non-action extra encoder onto the patch
-    tokens, so those inputs must share the pixel time axis. Action blocks
-    travel separately as ``action_history``.
+    tokens, so those inputs must share the pixel time axis. LeWM
+    concatenates ``proprio_encoder`` onto its CLS latent and needs the
+    same alignment. Action blocks travel separately as ``action_history``.
     """
     extras = getattr(model, 'extra_encoders', None) or {}
-    return ('pixels', *(key for key in extras if key != 'action'))
+    keys = ['pixels', *(key for key in extras if key != 'action')]
+    if (
+        getattr(model, 'proprio_encoder', None) is not None
+        and 'proprio' not in keys
+    ):
+        keys.append('proprio')
+    return tuple(keys)
 
 
 def configure_visuals(cfg):
