@@ -16,6 +16,13 @@ wandb:
     id: ${subdir}
     resume: allow
     log_model: False
+    # shared lets a validation server log validate_mse_* and validate_mpc/*
+    # into this run. This process is the primary writer.
+    settings:
+      mode: shared
+      x_primary: true
+      x_label: train
+      x_update_finish_state: true
 
 # Uploads weights_epoch_*.pt, config.json, and config.yaml to an existing
 # HF model repo. Auth: HF_TOKEN env var, or `huggingface-cli login`.

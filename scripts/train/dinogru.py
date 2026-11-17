@@ -21,7 +21,6 @@ Variants share this entry point. ``dinogru.yaml`` is variant D.
 the config, reused from a resumed run, or estimated once before the first step.
 """
 
-import os
 from functools import partial
 from pathlib import Path
 
@@ -30,9 +29,7 @@ import lightning as pl
 import stable_pretraining as spt
 import stable_worldmodel as swm
 import torch
-from lightning.pytorch.loggers import WandbLogger
 from omegaconf import OmegaConf, open_dict
-from stable_worldmodel.data import column_normalizer as get_column_normalizer
 from torch.nn import functional as F
 
 from dinowm import (
@@ -41,10 +38,10 @@ from dinowm import (
     _embedding_from_cache,
     _n_params,
     _patches_from_cache,
-    _resolve_cached_dino,
     _strip_action_dims,
     dinowm_forward,
-    get_img_preprocessor,
+    load_training_split,
+    make_wandb_logger,
 )
 from mosaic_predictors.dinogru import (
     deterministic_factors,
@@ -57,11 +54,21 @@ from mosaic_predictors.dinogru import (
     sample_factors,
     stored_s_r,
 )
-from validate_extra import ExtraValidationCallback
+from validate_extra import (
+    extra_runs_locally,
+    make_extra_callback,
+    require_remote_extra,
+)
 
 
 def _scale_needed(cfg):
     return bool(cfg.perturb.enabled) or bool(cfg.perturb.val_enabled)
+
+
+def apply_cfg_start_stride(cfg, dataset):
+    """Apply ``start_stride`` when the config has it. 1 leaves every start."""
+    stride = int(cfg.start_stride) if 'start_stride' in cfg else 1
+    apply_start_stride(dataset, stride)
 
 
 def apply_start_stride(dataset, start_stride):
@@ -334,35 +341,21 @@ def _resolve_s_r(model, dataset, cfg, device, ckpt_path, run_dir):
 def run(cfg):
     if _scale_needed(cfg):
         require_s_z(cfg.perturb.s_z, True)
+    require_remote_extra(cfg)
     with open_dict(cfg):
         cfg.data.dataset.num_steps = int(cfg.seq_len)
 
-    dataset_cfg = OmegaConf.to_container(cfg.data.dataset, resolve=True)
-    dataset_name = dataset_cfg.pop('name')
-    cache_dir = os.environ.get('LOCAL_DATASET_DIR', None)
-    print(
-        f'Loading dataset "{dataset_name}" from {"local cache: " + cache_dir if cache_dir else "default location"}'
+    split = load_training_split(
+        cfg,
+        before_split=lambda dataset: apply_cfg_start_stride(cfg, dataset),
     )
-    dataset = swm.data.load_dataset(
-        dataset_name, transform=None, cache_dir=cache_dir, **dataset_cfg
-    )
-    image_preprocess = get_img_preprocessor(
-        source='pixels',
-        target='pixels',
-        image_size=cfg.img_size,
-        encoder_image_size=cfg.encoder_img_size,
-    )
-    use_cache = _resolve_cached_dino(cfg)
-    column_transforms = []
+    dataset = split.dataset
+    dataset_name = split.dataset_name
+    cache_dir = split.cache_dir
+    image_preprocess = split.image_preprocess
+    column_transform = split.column_transform
 
     with open_dict(cfg):
-        cfg.cached_dino = use_cache
-        for col in cfg.data.dataset.keys_to_load:
-            if col.startswith('pixels') or col == DINO_COLUMN:
-                continue
-            normalizer = get_column_normalizer(dataset, col, col)
-            column_transforms.append(normalizer)
-
         cfg.model.extra_encoders.modules.action.in_chans = (
             cfg.data.dataset.frameskip * dataset.get_dim('action')
         )
@@ -377,33 +370,12 @@ def run(cfg):
         cfg.model.visual_dim = int(cfg.patch_embed_dim)
         cfg.model.action_dim = int(cfg.action_emb_dim)
 
-    column_transform = spt.data.transforms.Compose(*column_transforms)
-    if use_cache:
-        dataset.transform = column_transform
-        print(
-            'Training on cached DINOv2 patch tokens. '
-            'MPC and perturbed clips still run the encoder.'
-        )
-    else:
-        dataset.transform = spt.data.transforms.Compose(
-            image_preprocess, *column_transforms
-        )
-
-    stride = int(cfg.start_stride) if 'start_stride' in cfg else 1
-    apply_start_stride(dataset, stride)
-
-    rnd_gen = torch.Generator().manual_seed(cfg.seed)
-    train_set, val_set = spt.data.random_split(
-        dataset,
-        lengths=[cfg.train_split, 1 - cfg.train_split],
-        generator=rnd_gen,
-    )
     train = torch.utils.data.DataLoader(
-        train_set,
+        split.train_set,
         **cfg.loader,
-        generator=rnd_gen,
+        generator=split.generator,
     )
-    val = torch.utils.data.DataLoader(val_set, **cfg.val_loader)
+    val = torch.utils.data.DataLoader(split.val_set, **cfg.val_loader)
 
     encoder = hydra.utils.instantiate(cfg.model.encoder)
     hidden = encoder.config.hidden_size
@@ -503,9 +475,8 @@ def run(cfg):
         optim=optimizers,
     )
 
-    logger = None
-    if cfg.wandb.enabled:
-        logger = WandbLogger(**cfg.wandb.config)
+    logger = make_wandb_logger(cfg)
+    if logger is not None:
         logger.log_hyperparams(OmegaConf.to_container(cfg, resolve=True))
 
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -525,33 +496,16 @@ def run(cfg):
             full_cfg=cfg,
         )
     ]
-    extra = cfg.get('validate_extra')
-    if extra is not None and extra.get('enabled', False):
-        frames_dataset = None
-        mse_on = bool(extra.get('mse', {}).get('enabled', True))
-        if use_cache and mse_on and 'pixels' not in dataset.column_names:
-            frames_dataset = swm.data.load_dataset(
-                dataset_name,
-                cache_dir=cache_dir,
-                num_steps=int(dataset.num_steps),
-                frameskip=int(dataset.frameskip),
-                keys_to_load=['pixels', 'action', 'proprio', 'state'],
-            )
-            if frames_dataset.lengths.tolist() != dataset.lengths.tolist():
-                raise RuntimeError(
-                    'Pixel rows and cached DINO rows have different '
-                    'episode lengths, so the train split would not match.'
-                )
+    if extra_runs_locally(cfg):
         callbacks.append(
-            ExtraValidationCallback(
-                cfg=cfg,
+            make_extra_callback(
+                cfg,
                 dataset=dataset,
-                val_indices=list(val_set.indices),
+                val_indices=list(split.val_set.indices),
                 image_preprocess=image_preprocess,
                 column_transform=column_transform,
                 cache_dir=cache_dir,
                 dataset_name=dataset_name,
-                frames_dataset=frames_dataset,
             )
         )
 

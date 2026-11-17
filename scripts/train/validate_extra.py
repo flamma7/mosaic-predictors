@@ -369,6 +369,65 @@ def _subsample(windows, num_samples, seed):
     return [windows[int(i)] for i in pick]
 
 
+def _extra_cfg(cfg):
+    if cfg is None:
+        return None
+    return cfg.get('validate_extra')
+
+
+def extra_runs_on_server(cfg):
+    """True when MSE and MPC are queued for a validation server."""
+    extra = _extra_cfg(cfg)
+    if extra is None or not bool(extra.get('enabled', False)):
+        return False
+    return bool(extra.get('on_validation_server', False))
+
+
+def extra_runs_locally(cfg):
+    """True when this process should run MSE and MPC after validation."""
+    extra = _extra_cfg(cfg)
+    if extra is None or not bool(extra.get('enabled', False)):
+        return False
+    return not bool(extra.get('on_validation_server', False))
+
+
+def require_remote_extra(cfg):
+    """Fail before training if a remote job could not be logged or downloaded."""
+    if not extra_runs_on_server(cfg):
+        return
+    from omegaconf import OmegaConf
+
+    if not bool(cfg.wandb.enabled):
+        raise RuntimeError(
+            'validate_extra.on_validation_server logs into the training '
+            'W&B run, so wandb.enabled must be true.'
+        )
+    wandb_id = OmegaConf.select(cfg, 'wandb.config.id')
+    if wandb_id is None or str(wandb_id) == '':
+        raise RuntimeError(
+            'validate_extra.on_validation_server needs wandb.config.id '
+            'so the validation server can resume that run.'
+        )
+    settings = OmegaConf.select(cfg, 'wandb.config.settings')
+    mode = None if settings is None else settings.get('mode')
+    if mode != 'shared':
+        raise RuntimeError(
+            'validate_extra.on_validation_server needs '
+            'wandb.config.settings.mode=shared so the validation server '
+            'can log into this run.'
+        )
+    hf_cfg = cfg.get('hf')
+    if hf_cfg is None or not bool(hf_cfg.get('enabled', False)):
+        raise RuntimeError(
+            'validate_extra.on_validation_server reads checkpoints from '
+            'the Hugging Face repo, so hf.enabled must be true.'
+        )
+    if not hf_cfg.get('repo_id'):
+        raise RuntimeError(
+            'validate_extra.on_validation_server needs hf.repo_id.'
+        )
+
+
 def _report(pl_module, metrics):
     """Log through Lightning so these share the validation step record.
 
@@ -378,7 +437,7 @@ def _report(pl_module, metrics):
     """
     for key, value in metrics.items():
         print(f'[validate_extra] {key}: {value:.6f}')
-    if not metrics:
+    if not metrics or pl_module is None:
         return
     pl_module.log_dict(
         {key: float(value) for key, value in metrics.items()},
@@ -540,28 +599,39 @@ class ExtraValidationCallback(Callback):
             self._run(trainer, pl_module)
         _barrier(trainer)
 
-    def _run(self, trainer, pl_module):
-        model = pl_module.model
+    def collect_metrics(self, model, module, epoch=None):
+        """MSE and MPC. ``module.model`` is restored to ``model`` afterward."""
         was_training = model.training
         model.eval()
         names = ', '.join(name for name, _ in self.perturbations)
-        print(f'[validate_extra] epoch {trainer.current_epoch + 1}: {names}')
+        label = f'epoch {epoch}' if epoch is not None else 'checkpoint'
+        print(f'[validate_extra] {label}: {names}')
+        metrics = {}
         try:
             if self.mse_enabled and self.windows:
-                self._run_mse(pl_module, model)
+                metrics.update(self._run_mse(model))
             elif self.mse_enabled:
                 print('[validate_extra] no validation clip fits the rollout')
             if self.mpc_enabled:
-                self._run_mpc(pl_module, model)
+                metrics.update(self._run_mpc(module, model))
         finally:
-            pl_module.model = model
+            module.model = model
             if hasattr(model, 'reset_persistent_memory'):
                 model.reset_persistent_memory()
             elif hasattr(model, '_init_cached_info'):
                 del model._init_cached_info
             model.train(was_training)
+        return metrics
 
-    def _run_mse(self, pl_module, model):
+    def _run(self, trainer, pl_module):
+        metrics = self.collect_metrics(
+            pl_module.model,
+            pl_module,
+            epoch=trainer.current_epoch + 1,
+        )
+        _report(pl_module, metrics)
+
+    def _run_mse(self, model):
         device = next(model.parameters()).device
         use_autocast = self.bf16 and device.type == 'cuda'
         frames = self.frames_dataset
@@ -631,7 +701,7 @@ class ExtraValidationCallback(Callback):
                     )
         finally:
             frames.transform = previous
-        _report(pl_module, metrics)
+        return metrics
 
     def _run_mpc(self, pl_module, model):
         if self._mpc_ready is None:
@@ -645,7 +715,7 @@ class ExtraValidationCallback(Callback):
             )
             rate = self._mpc_one(pl_module, model, spec, ready)
             metrics[f'validate_mpc/{name}'] = rate
-        _report(pl_module, metrics)
+        return metrics
 
     def _prepare_mpc(self, model):
         mpc = self.cfg.validate_extra.mpc
@@ -810,6 +880,47 @@ class ExtraValidationCallback(Callback):
             if hasattr(model, '_init_cached_info'):
                 del model._init_cached_info
             world.close()
+
+
+def make_extra_callback(
+    cfg,
+    dataset,
+    val_indices,
+    image_preprocess,
+    column_transform,
+    cache_dir,
+    dataset_name,
+):
+    """Build the callback the training loop and the validation server share."""
+    extra = cfg.get('validate_extra')
+    if extra is None or not bool(extra.get('enabled', False)):
+        return None
+    frames_dataset = None
+    mse_on = bool(extra.get('mse', {}).get('enabled', True))
+    use_cache = bool(cfg.get('cached_dino'))
+    if use_cache and mse_on and 'pixels' not in dataset.column_names:
+        frames_dataset = swm.data.load_dataset(
+            dataset_name,
+            cache_dir=cache_dir,
+            num_steps=int(dataset.num_steps),
+            frameskip=int(dataset.frameskip),
+            keys_to_load=['pixels', 'action', 'proprio', 'state'],
+        )
+        if frames_dataset.lengths.tolist() != dataset.lengths.tolist():
+            raise RuntimeError(
+                'Pixel rows and cached DINO rows have different '
+                'episode lengths, so the train split would not match.'
+            )
+    return ExtraValidationCallback(
+        cfg=cfg,
+        dataset=dataset,
+        val_indices=list(val_indices),
+        image_preprocess=image_preprocess,
+        column_transform=column_transform,
+        cache_dir=cache_dir,
+        dataset_name=dataset_name,
+        frames_dataset=frames_dataset,
+    )
 
 
 def _barrier(trainer):

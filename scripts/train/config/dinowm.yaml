@@ -66,8 +66,16 @@ wm:
 # val/* loss is unchanged. Success rates are percents. MSE is the
 # action-stripped latent error against the perturbed encoding.
 # Set a perturbation's enabled flag to false to drop it from both logs.
+# on_validation_server keeps val/* on this machine and appends each
+# checkpoint to validation.csv on the Hugging Face repo
+# (model_name, checkpoint_name, wandb_id, global_step, started,
+# machine_job_id, completed). global_step is the trainer/global_step
+# Lightning logged for this epoch. scripts/train/validate_server.py
+# claims the row.
+# wandb.config.settings.mode must be shared.
 validate_extra:
   enabled: true
+  on_validation_server: false
   every_n_epochs: 1
   mse:
     enabled: true

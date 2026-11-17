@@ -15,7 +15,17 @@ from stable_worldmodel.data import column_normalizer as get_column_normalizer
 from stable_worldmodel.wm.utils import save_pretrained
 from torch.nn import functional as F
 
-from validate_extra import ExtraValidationCallback
+from validate_extra import (
+    extra_runs_locally,
+    extra_runs_on_server,
+    make_extra_callback,
+    require_remote_extra,
+)
+from validation_queue import (
+    ValidationQueue,
+    logged_global_step,
+    queue_this_epoch,
+)
 
 
 def get_img_preprocessor(
@@ -45,6 +55,124 @@ CONFIG_YAML = 'config.yaml'
 # DINOv2 sequence written by precompute_dino.py. One fp16 row per frame:
 # CLS, then the patch grid, flattened. Training drops the CLS token.
 DINO_COLUMN = 'dino'
+
+
+class TrainingSplit:
+    """Dataset view shared by training and the extra-validation server."""
+
+    def __init__(
+        self,
+        dataset,
+        dataset_name,
+        cache_dir,
+        image_preprocess,
+        column_transform,
+        use_cache,
+        train_set,
+        val_set,
+        generator,
+    ):
+        self.dataset = dataset
+        self.dataset_name = dataset_name
+        self.cache_dir = cache_dir
+        self.image_preprocess = image_preprocess
+        self.column_transform = column_transform
+        self.use_cache = use_cache
+        self.train_set = train_set
+        self.val_set = val_set
+        self.generator = generator
+
+
+def load_training_split(cfg, before_split=None):
+    """Load the dataset and the seeded train/val split.
+
+    ``before_split`` runs after the transform is attached and before the
+    split. DINO-GRU uses it to apply ``start_stride``. The generator is
+    the one ``random_split`` consumed, so the train loader must keep
+    using it.
+    """
+    dataset_cfg = OmegaConf.to_container(cfg.data.dataset, resolve=True)
+    dataset_name = dataset_cfg.pop('name')
+    cache_dir = os.environ.get('LOCAL_DATASET_DIR', None)
+    print(
+        f'Loading dataset "{dataset_name}" from {"local cache: " + cache_dir if cache_dir else "default location"}'
+    )
+    dataset = swm.data.load_dataset(
+        dataset_name, transform=None, cache_dir=cache_dir, **dataset_cfg
+    )
+    image_preprocess = get_img_preprocessor(
+        source='pixels',
+        target='pixels',
+        image_size=cfg.img_size,
+        encoder_image_size=cfg.encoder_img_size,
+    )
+    use_cache = _resolve_cached_dino(cfg)
+    column_transforms = []
+    with open_dict(cfg):
+        cfg.cached_dino = use_cache
+        for col in cfg.data.dataset.keys_to_load:
+            # `dino` is the frozen patch grid. Fitting a scaler would read
+            # the whole column (hundreds of GB) and then rescale the target.
+            if col.startswith('pixels') or col == DINO_COLUMN:
+                continue
+            normalizer = get_column_normalizer(dataset, col, col)
+            column_transforms.append(normalizer)
+
+    column_transform = spt.data.transforms.Compose(*column_transforms)
+    if use_cache:
+        # No pixels in this loader. Perturbed MSE opens a second reader.
+        dataset.transform = column_transform
+        print(
+            'Training on cached DINOv2 patch tokens. '
+            'MPC and perturbed clips still run the encoder.'
+        )
+    else:
+        dataset.transform = spt.data.transforms.Compose(
+            image_preprocess, *column_transforms
+        )
+    if before_split is not None:
+        before_split(dataset)
+    generator = torch.Generator().manual_seed(cfg.seed)
+    train_set, val_set = spt.data.random_split(
+        dataset,
+        lengths=[cfg.train_split, 1 - cfg.train_split],
+        generator=generator,
+    )
+    return TrainingSplit(
+        dataset=dataset,
+        dataset_name=dataset_name,
+        cache_dir=cache_dir,
+        image_preprocess=image_preprocess,
+        column_transform=column_transform,
+        use_cache=use_cache,
+        train_set=train_set,
+        val_set=val_set,
+        generator=generator,
+    )
+
+
+def wandb_logger_config(cfg):
+    """Plain kwargs for WandbLogger.
+
+    Remote extra validation forces shared mode on the training process,
+    which is the primary writer. The validation server joins as a
+    non-primary writer on the same run id.
+    """
+    wandb_cfg = OmegaConf.to_container(cfg.wandb.config, resolve=True)
+    if extra_runs_on_server(cfg):
+        settings = dict(wandb_cfg.get('settings') or {})
+        settings['mode'] = 'shared'
+        settings['x_primary'] = True
+        settings.setdefault('x_label', 'train')
+        settings['x_update_finish_state'] = True
+        wandb_cfg['settings'] = settings
+    return wandb_cfg
+
+
+def make_wandb_logger(cfg):
+    if not cfg.wandb.enabled:
+        return None
+    return WandbLogger(**wandb_logger_config(cfg))
 
 
 def _hf_path_prefix(hf_cfg, run_name):
@@ -92,11 +220,11 @@ class SaveCkptCallback(Callback):
 
         if trainer.is_global_zero:
             if (trainer.current_epoch + 1) % self.epoch_interval == 0:
-                self._save(pl_module.model, trainer.current_epoch + 1)
+                self._save(pl_module.model, trainer, trainer.current_epoch + 1)
 
             # save final epoch
             if (trainer.current_epoch + 1) == trainer.max_epochs:
-                self._save(pl_module.model, trainer.current_epoch + 1)
+                self._save(pl_module.model, trainer, trainer.current_epoch + 1)
 
     def _get_hf_api(self):
         if self._hf_api is not None:
@@ -149,7 +277,7 @@ class SaveCkptCallback(Callback):
         )
         return CONFIG_YAML
 
-    def _save(self, model, epoch):
+    def _save(self, model, trainer, epoch):
         filename = f'weights_epoch_{epoch}.pt'
         save_pretrained(
             model,
@@ -161,6 +289,44 @@ class SaveCkptCallback(Callback):
         self._upload_to_hf(filename)
         if (self._ckpt_dir / CONFIG_YAML).exists():
             self._upload_to_hf(CONFIG_YAML)
+        self._queue_remote_validation(filename, epoch, trainer)
+
+    def _queue_remote_validation(self, filename, epoch, trainer):
+        if self.full_cfg is None or not extra_runs_on_server(self.full_cfg):
+            return
+        extra = self.full_cfg.validate_extra
+        if not queue_this_epoch(epoch, extra.get('every_n_epochs', 1)):
+            return
+        if not self.hf_cfg.get('enabled'):
+            raise RuntimeError(
+                'Remote extra validation needs the checkpoint on Hugging Face.'
+            )
+        wandb_id = OmegaConf.select(self.full_cfg, 'wandb.config.id')
+        if wandb_id is None or str(wandb_id) == '':
+            raise RuntimeError(
+                'Remote extra validation needs wandb.config.id.'
+            )
+        model_name = _hf_path_prefix(self.hf_cfg, self.run_name).strip('/')
+        # Same integer WandbLogger writes as trainer/global_step for the
+        # val/* record of this epoch. Extra validation is inside that record
+        # when it runs on the training machine.
+        global_step = logged_global_step(
+            trainer.fit_loop.epoch_loop._batches_that_stepped
+        )
+        queue = ValidationQueue(self.hf_cfg['repo_id'], api=self._get_hf_api())
+        added = queue.enqueue(
+            model_name, filename, str(wandb_id), global_step
+        )
+        if added:
+            print(
+                f'[validate_extra] queued {model_name}/{filename} '
+                f'wandb={wandb_id} trainer/global_step={global_step}'
+            )
+        else:
+            print(
+                f'[validate_extra] {model_name}/{filename} '
+                'is already in validation.csv'
+            )
 
 
 def _strip_action_dims(tensor, action_range):
@@ -306,35 +472,15 @@ def run(cfg):
     ##       dataset       ##
     #########################
 
-    dataset_cfg = OmegaConf.to_container(cfg.data.dataset, resolve=True)
-    dataset_name = dataset_cfg.pop('name')
-    cache_dir = os.environ.get('LOCAL_DATASET_DIR', None)
-    print(
-        f'Loading dataset "{dataset_name}" from {"local cache: " + cache_dir if cache_dir else "default location"}'
-    )
-    dataset = swm.data.load_dataset(
-        dataset_name, transform=None, cache_dir=cache_dir, **dataset_cfg
-    )
-    image_preprocess = get_img_preprocessor(
-        source='pixels',
-        target='pixels',
-        image_size=cfg.img_size,
-        encoder_image_size=cfg.encoder_img_size,
-    )
-    use_cache = _resolve_cached_dino(cfg)
-    column_transforms = []
+    require_remote_extra(cfg)
+    split = load_training_split(cfg)
+    dataset = split.dataset
+    dataset_name = split.dataset_name
+    cache_dir = split.cache_dir
+    image_preprocess = split.image_preprocess
+    column_transform = split.column_transform
 
     with open_dict(cfg):
-        cfg.cached_dino = use_cache
-        for col in cfg.data.dataset.keys_to_load:
-            # `dino` is the frozen patch grid. Fitting a scaler would read
-            # the whole column (hundreds of GB) and then rescale the target.
-            if col.startswith('pixels') or col == DINO_COLUMN:
-                continue
-
-            normalizer = get_column_normalizer(dataset, col, col)
-            column_transforms.append(normalizer)
-
         # Actions are concatenated across the frameskip. Proprio is subsampled.
         cfg.model.extra_encoders.modules.action.in_chans = (
             cfg.data.dataset.frameskip * dataset.get_dim('action')
@@ -346,32 +492,12 @@ def run(cfg):
         else:
             del cfg.model.extra_encoders.modules['proprio']
 
-    column_transform = spt.data.transforms.Compose(*column_transforms)
-    if use_cache:
-        # No pixels in this loader. Perturbed MSE opens a second reader.
-        dataset.transform = column_transform
-        print(
-            'Training on cached DINOv2 patch tokens. '
-            'MPC and perturbed clips still run the encoder.'
-        )
-    else:
-        dataset.transform = spt.data.transforms.Compose(
-            image_preprocess, *column_transforms
-        )
-
-    rnd_gen = torch.Generator().manual_seed(cfg.seed)
-    train_set, val_set = spt.data.random_split(
-        dataset,
-        lengths=[cfg.train_split, 1 - cfg.train_split],
-        generator=rnd_gen,
-    )
-
     train = torch.utils.data.DataLoader(
-        train_set,
+        split.train_set,
         **cfg.loader,
-        generator=rnd_gen,
+        generator=split.generator,
     )
-    val = torch.utils.data.DataLoader(val_set, **cfg.val_loader)
+    val = torch.utils.data.DataLoader(split.val_set, **cfg.val_loader)
 
     ##############################
     ##       model / optim      ##
@@ -462,9 +588,8 @@ def run(cfg):
         swm.data.utils.get_cache_dir(sub_folder='checkpoints'), run_id
     )
 
-    logger = None
-    if cfg.wandb.enabled:
-        logger = WandbLogger(**cfg.wandb.config)
+    logger = make_wandb_logger(cfg)
+    if logger is not None:
         logger.log_hyperparams(OmegaConf.to_container(cfg))
 
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -484,33 +609,16 @@ def run(cfg):
             full_cfg=cfg,
         )
     ]
-    extra = cfg.get('validate_extra')
-    if extra is not None and extra.get('enabled', False):
-        frames_dataset = None
-        mse_on = bool(extra.get('mse', {}).get('enabled', True))
-        if use_cache and mse_on and 'pixels' not in dataset.column_names:
-            frames_dataset = swm.data.load_dataset(
-                dataset_name,
-                cache_dir=cache_dir,
-                num_steps=int(dataset.num_steps),
-                frameskip=int(dataset.frameskip),
-                keys_to_load=['pixels', 'action', 'proprio', 'state'],
-            )
-            if frames_dataset.lengths.tolist() != dataset.lengths.tolist():
-                raise RuntimeError(
-                    'Pixel rows and cached DINO rows have different '
-                    'episode lengths, so the train split would not match.'
-                )
+    if extra_runs_locally(cfg):
         callbacks.append(
-            ExtraValidationCallback(
-                cfg=cfg,
+            make_extra_callback(
+                cfg,
                 dataset=dataset,
-                val_indices=list(val_set.indices),
+                val_indices=list(split.val_set.indices),
                 image_preprocess=image_preprocess,
                 column_transform=column_transform,
                 cache_dir=cache_dir,
                 dataset_name=dataset_name,
-                frames_dataset=frames_dataset,
             )
         )
 
