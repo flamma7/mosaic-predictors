@@ -1,0 +1,223 @@
+defaults:
+  - launcher: local
+  - data: pusht
+  # After the dataset group, so seq_len replaces history_size + num_preds.
+  - _self_
+
+output_model_name: dinogru
+subdir: ${hydra:job.id}
+
+num_workers: 8
+train_split: 0.9
+seed: 3072
+# Table 12 render size, then the encoder resize. DINOv2 ViT-S/14 on a
+# 196 input yields the 14 x 14 x 384 patch grid.
+img_size: 224
+encoder_img_size: 196
+patch_size: 14
+patch_embed_dim: 384
+action_emb_dim: 10
+# Set true to concatenate a proprio embedding onto each patch and include
+# it in the latent target. It shares the action-encoder learning rate.
+use_proprio: true
+proprio_emb_dim: 10
+dump_object: True
+# null follows the dataset: on when `dino` is in keys_to_load
+# (`data=pusht_dino`), off for the JPEG dataset. MPC and the perturbed
+# open-loop MSE still run DINOv2 on live or corrupted frames.
+cached_dino: null
+
+# Variant D is the default (GRU on, mean pool, perturbations on).
+# A: gru.enabled=false perturb.enabled=false
+# B: gru.enabled=false perturb.enabled=true
+# C: gru.enabled=true  perturb.enabled=false gru.pooling=meanpool
+# D: gru.enabled=true  perturb.enabled=true  gru.pooling=meanpool
+# E: gru.enabled=true  perturb.enabled=true  gru.pooling=attention
+# A matches DINO-WM on a short clip when seq_len is history_size + num_preds.
+seq_len: 16
+
+gru:
+  enabled: true
+  hidden_dim: 256
+  num_layers: 1
+  input_dim: 256
+  pooling: meanpool
+  num_queries: 1
+  # Validation ablation: zero the GRU state before every frame.
+  reset_memory_each_step: false
+
+perturb:
+  enabled: true
+  alpha: 0.2
+  rank: 8
+  activation: gelu
+  v1: 1.0
+  v2: 1.0
+  zero_fraction: 0.25
+  eps: 1.0e-8
+  # Required when perturbations are on. Fill this from compute_dino_sz.py.
+  # Training does not estimate it.
+  s_z: 2.455394
+  # Null with calibrate_s_r runs once at startup, then this file stores it.
+  s_r: null
+  calibrate_s_r: true
+  # Deterministic held-out noise on the validation forward and open-loop MSE.
+  val_enabled: false
+  calibration:
+    num_samples: 1024
+    num_matrices: 16
+    batch_size: 64
+    seed: 42
+
+trainer:
+  max_epochs: 10 #100
+  devices: auto
+  accelerator: gpu
+  precision: bf16
+  gradient_clip_val: 1.0
+
+loader:
+  batch_size: 32
+  num_workers: ${num_workers}
+  drop_last: True
+  persistent_workers: True
+  prefetch_factor: 3
+  pin_memory: True
+  shuffle: True
+
+val_loader:
+  batch_size: ${loader.batch_size}
+  num_workers: ${num_workers}
+  drop_last: False
+  persistent_workers: True
+  prefetch_factor: ${loader.prefetch_factor}
+  pin_memory: ${loader.pin_memory}
+  shuffle: False
+
+optimizer:
+  type: AdamW
+  weight_decay: 1e-3
+
+predictor_lr: 5.0e-5
+action_encoder_lr: 5.0e-4
+
+wm:
+  history_size: 3
+  num_preds: 1
+
+# After each validation epoch, on the weights just saved. The regular
+# val/* loss is unchanged. Success rates are percents. MSE is the
+# action-stripped latent error against the perturbed encoding.
+# Set a perturbation's enabled flag to false to drop it from both logs.
+validate_extra:
+  enabled: true
+  every_n_epochs: 1
+  mse:
+    enabled: true
+    # Model steps rolled out after the history window. Clips are
+    # history_size + pred_length frames from the validation split.
+    pred_length: 25
+    horizons: [1, 5, 10, 15, 25]
+    # null scores every validation clip long enough for the rollout.
+    num_samples: 64
+  mpc:
+    enabled: true
+    num_eval: 25
+    seed: ${seed}
+    goal_offset_steps: 25
+    eval_budget: 50
+    horizon: 5
+    receding_horizon: 5
+    action_block: ${data.dataset.frameskip}
+    num_samples: 300
+    n_steps: 30
+    topk: 30
+    var_scale: 1.0
+    env_name: swm/PushT-v1
+  perturbations:
+    none:
+      enabled: true
+    blur:
+      enabled: true
+      blur: true
+    snp1:
+      enabled: true
+      salt_pepper: true
+    snp5:
+      enabled: true
+      salt_pepper: 0.05
+    dark:
+      enabled: true
+      dark: 0.7
+    red-agent:
+      enabled: true
+      agent_color: red
+    red-block:
+      enabled: true
+      block_color: red
+    red-anchor:
+      enabled: true
+      anchor_color: red
+
+backbone:
+  name: dinov2_small
+
+# Training clips. The transformer window stays wm.history_size.
+data:
+  dataset:
+    num_steps: ${seq_len}
+
+model:
+  _target_: mosaic_predictors.dinogru.DinoGRU
+  history_size: ${wm.history_size}
+  num_pred: ${wm.num_preds}
+  interpolate_pos_encoding: true
+  gru_enabled: ${gru.enabled}
+  gru_hidden: ${gru.hidden_dim}
+  gru_layers: ${gru.num_layers}
+  gru_input_dim: ${gru.input_dim}
+  gru_pooling: ${gru.pooling}
+  gru_num_queries: ${gru.num_queries}
+  gru_reset_each_step: ${gru.reset_memory_each_step}
+  visual_dim: ${patch_embed_dim}
+  proprio_dim: ${proprio_emb_dim}
+  action_dim: ${action_emb_dim}
+  val_perturb: ${perturb.val_enabled}
+  perturb_alpha: ${perturb.alpha}
+  perturb_rank: ${perturb.rank}
+  perturb_activation: ${perturb.activation}
+  perturb_v1: ${perturb.v1}
+  perturb_v2: ${perturb.v2}
+  perturb_zero_fraction: ${perturb.zero_fraction}
+  perturb_eps: ${perturb.eps}
+  perturb_seed: ${seed}
+  s_z: ${perturb.s_z}
+  s_r: ${perturb.s_r}
+  encoder:
+    _target_: stable_pretraining.backbone.EvalOnly
+    backbone:
+      _target_: stable_worldmodel.wm.prejepa.module.create_backbone
+      name: ${backbone.name}
+  predictor:
+    _target_: stable_worldmodel.wm.prejepa.module.CausalPredictor
+    num_patches: ???
+    num_frames: ${wm.history_size}
+    dim: ???
+    depth: 6
+    heads: 16
+    mlp_dim: 2048
+    dim_head: 64
+    dropout: 0.1
+    emb_dropout: 0.0
+    pool: mean
+  extra_encoders:
+    _target_: torch.nn.ModuleDict
+    modules:
+      proprio:
+        _target_: stable_worldmodel.wm.prejepa.module.Embedder
+        in_chans: ???
+        emb_dim: ${proprio_emb_dim}
+      action:
+        _target_: stable_worldmodel.wm.prejepa.module.Embedder
+        in_chans: ???
+        emb_dim: ${action_emb_dim}

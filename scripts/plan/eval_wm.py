@@ -198,7 +198,8 @@ def run(cfg: DictConfig):
                 torch.compile(getattr(model, encoder_attr)),
             )
             model.predictor = torch.compile(model.predictor)
-        config = swm.PlanConfig(**cfg.plan_config)
+        plan_kwargs = OmegaConf.to_container(cfg.plan_config, resolve=True)
+        config = swm.PlanConfig(**plan_kwargs)
         objective = hydra.utils.instantiate(cfg.objective)
         cost = swm.planning.ShootingCostEvaluator(model, objective)
         solver = hydra.utils.instantiate(cfg.solver, cost=cost)
@@ -209,6 +210,9 @@ def run(cfg: DictConfig):
             transform=transform,
             history_keys=_history_keys(model),
         )
+        from mosaic_predictors.dinogru import attach_live_memory
+
+        attach_live_memory(policy, model)
 
     else:
         policy = swm.policy.RandomPolicy()

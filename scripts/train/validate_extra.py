@@ -265,6 +265,10 @@ def _split_latent(model):
 
 
 def _rollout_mse(model, batch, history_size, num_preds, horizons):
+    if getattr(model, 'gru_enabled', False):
+        return model.rollout_horizon_mse(
+            batch, history_size, num_preds, horizons
+        )
     if _split_latent(model):
         return rollout_horizon_mse(
             model, batch, history_size, num_preds, horizons
@@ -551,7 +555,9 @@ class ExtraValidationCallback(Callback):
                 self._run_mpc(pl_module, model)
         finally:
             pl_module.model = model
-            if hasattr(model, '_init_cached_info'):
+            if hasattr(model, 'reset_persistent_memory'):
+                model.reset_persistent_memory()
+            elif hasattr(model, '_init_cached_info'):
                 del model._init_cached_info
             model.train(was_training)
 
@@ -725,7 +731,9 @@ class ExtraValidationCallback(Callback):
         }
 
     def _mpc_one(self, pl_module, model, spec, ready):
-        if hasattr(model, '_init_cached_info'):
+        if hasattr(model, 'reset_persistent_memory'):
+            model.reset_persistent_memory()
+        elif hasattr(model, '_init_cached_info'):
             del model._init_cached_info
         visual_cfg = OmegaConf.create(
             {
@@ -776,6 +784,9 @@ class ExtraValidationCallback(Callback):
                 transform=ready['transform'],
                 history_keys=_history_keys(model),
             )
+            from mosaic_predictors.dinogru import attach_live_memory
+
+            attach_live_memory(policy, model)
             world.set_policy(policy)
             device_type = ready['device'].type
             with torch.no_grad(), torch.autocast(
