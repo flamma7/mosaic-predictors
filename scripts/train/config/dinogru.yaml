@@ -35,6 +35,11 @@ cached_dino: null
 # E: gru.enabled=true  perturb.enabled=true  gru.pooling=attention
 # A matches DINO-WM on a short clip when seq_len is history_size + num_preds.
 seq_len: 16
+# Raw steps between consecutive clip starts. 1 keeps every start.
+# 2 with seq_len 4 and frameskip 5 yields (0, 5, 10, 15) then (2, 7, 12, 17).
+# The train/val split is taken after this, so a value other than 1 is a
+# different set of clips.
+start_stride: 1
 
 gru:
   enabled: true

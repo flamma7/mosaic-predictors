@@ -64,6 +64,32 @@ def _scale_needed(cfg):
     return bool(cfg.perturb.enabled) or bool(cfg.perturb.val_enabled)
 
 
+def apply_start_stride(dataset, start_stride):
+    """Keep every ``start_stride``-th raw clip start.
+
+    1 leaves every start that fits the clip. 2 at frameskip 5 and
+    seq_len 4 is (0, 5, 10, 15) then (2, 7, 12, 17).
+    """
+    stride = int(start_stride)
+    if stride < 1:
+        raise ValueError(f'start_stride must be >= 1, got {stride}')
+    if stride == 1:
+        return
+    if not hasattr(dataset, 'clip_indices'):
+        raise RuntimeError(
+            'start_stride needs a dataset indexed by clip start'
+        )
+    before = len(dataset.clip_indices)
+    dataset.clip_indices = [
+        (episode, start)
+        for episode, start in dataset.clip_indices
+        if int(start) % stride == 0
+    ]
+    print(
+        f'start_stride {stride}: {before} -> {len(dataset.clip_indices)} clips'
+    )
+
+
 def _clip_length(batch):
     for key in (DINO_COLUMN, 'pixels', 'action', 'proprio'):
         value = batch.get(key)
@@ -362,6 +388,9 @@ def run(cfg):
         dataset.transform = spt.data.transforms.Compose(
             image_preprocess, *column_transforms
         )
+
+    stride = int(cfg.start_stride) if 'start_stride' in cfg else 1
+    apply_start_stride(dataset, stride)
 
     rnd_gen = torch.Generator().manual_seed(cfg.seed)
     train_set, val_set = spt.data.random_split(

@@ -200,6 +200,35 @@ class DinoGRUTests(unittest.TestCase):
         self.assertTrue(torch.allclose(pred, manual))
         self.assertTrue(torch.allclose(tgt, emb[:, 1:]))
 
+    def test_start_stride_spaces_clip_starts(self):
+        train = _load_train()
+
+        def clips(length, seq_len=4, frameskip=5):
+            span = seq_len * frameskip
+            dataset = type('Clips', (), {})()
+            dataset.clip_indices = [
+                (0, start) for start in range(length - span + 1)
+            ]
+            return dataset
+
+        def frames(start, seq_len=4, frameskip=5):
+            return [start + step * frameskip for step in range(seq_len)]
+
+        dense = clips(80)
+        before = list(dense.clip_indices)
+        train.apply_start_stride(dense, 1)
+        self.assertEqual(dense.clip_indices, before)
+
+        spaced = clips(80)
+        train.apply_start_stride(spaced, 2)
+        starts = [start for _, start in spaced.clip_indices]
+        self.assertEqual(starts[:3], [0, 2, 4])
+        self.assertEqual(frames(starts[0]), [0, 5, 10, 15])
+        self.assertEqual(frames(starts[1]), [2, 7, 12, 17])
+
+        with self.assertRaises(ValueError):
+            train.apply_start_stride(clips(80), 0)
+
     def test_sequence_16_alignment(self):
         model = make_model(gru=True, pooling='meanpool')
         model.eval()
@@ -573,6 +602,7 @@ class DinoGRUTests(unittest.TestCase):
             self.assertEqual(bool(cfg.perturb.enabled), perturb, name)
             self.assertEqual(str(cfg.gru.pooling), pooling, name)
             self.assertEqual(int(cfg.seq_len), 16, name)
+            self.assertEqual(int(cfg.start_stride), 1, name)
             self.assertEqual(int(cfg.data.dataset.num_steps), 16, name)
             self.assertEqual(int(cfg.wm.history_size), 3, name)
             self.assertEqual(int(cfg.gru.hidden_dim), 256, name)
