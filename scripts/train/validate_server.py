@@ -41,7 +41,11 @@ from omegaconf.errors import OmegaConfBaseException
 from dinogru import apply_cfg_start_stride
 from dinowm import load_training_split
 from validate_extra import make_extra_callback
-from validation_queue import ValidationQueue, extra_validation_log
+from validation_queue import (
+    ValidationQueue,
+    define_trainer_step_axis,
+    extra_validation_log,
+)
 
 _EPOCH = re.compile(r'^weights_epoch_(\d+)\.pt$')
 _DEFAULT_REPO = 'flamma77/mosaic_predictors'
@@ -84,8 +88,9 @@ def log_to_wandb(cfg, job, machine_job_id, metrics, global_step, epoch_index):
     """Log like WandbLogger, at the training epoch's trainer/global_step.
 
     The internal W&B step only moves forward, and training is already past
-    this epoch, so ``step`` is left unset. ``step_sync`` stays off for these
-    keys so the late write still plots at the recorded ``trainer/global_step``
+    this epoch, so ``step`` is left unset. Charts are defined against
+    ``trainer/global_step`` (the ``global_step`` column of validation.csv).
+    ``step_sync`` stays off so this late write still plots at that value
     instead of being rejected as a step in the past. ``epoch`` is Lightning's
     0-based ``current_epoch``, added to the same record as the metrics.
     """
@@ -104,13 +109,7 @@ def log_to_wandb(cfg, job, machine_job_id, metrics, global_step, epoch_index):
         },
     )
     try:
-        run.define_metric('trainer/global_step')
-        for pattern in ('validate_*', 'validate_mse_*', 'validate_mpc/*'):
-            run.define_metric(
-                pattern,
-                step_metric='trainer/global_step',
-                step_sync=False,
-            )
+        define_trainer_step_axis(run, cfg, metrics=metrics)
         wandb.log(extra_validation_log(metrics, global_step, epoch_index))
     finally:
         run.finish()

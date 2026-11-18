@@ -14,12 +14,15 @@ from validation_queue import (  # noqa: E402
     ValidationQueue,
     claim_job,
     complete_job,
+    define_trainer_step_axis,
     dumps,
     enqueue_job,
     extra_validation_log,
     loads,
     logged_global_step,
     queue_this_epoch,
+    section_glob,
+    trainer_step_patterns,
 )
 
 
@@ -209,6 +212,68 @@ class ValidationQueueTests(unittest.TestCase):
             queue.complete(foreign, 'val-0')
         self.assertEqual(queue.rows[0]['machine_job_id'], 'val-1')
         self.assertEqual(queue.rows[0]['completed'], 'false')
+
+    def test_slashed_metrics_plot_on_trainer_global_step(self):
+        def matches(pattern, name):
+            # W&B globs: a trailing * does not consume a slash.
+            if not str(pattern).endswith('*'):
+                return pattern == name
+            prefix = pattern[:-1]
+            if not name.startswith(prefix):
+                return False
+            return '/' not in name[len(prefix):]
+
+        metrics = (
+            'fit/loss',
+            'fit/proprio_loss',
+            'validate/loss',
+            'validate_mse_1/none',
+            'validate_mse_25/blur',
+            'validate_mpc/none',
+            'hparams/lr_predictor_opt',
+        )
+        # Lightning's "*" and the old server globs miss every slashed name
+        # except validate_mpc/*, which is why those charts used Step.
+        for name in metrics:
+            self.assertFalse(matches('*', name), name)
+            if not name.startswith('validate_mpc/'):
+                self.assertFalse(matches('validate_mpc/*', name), name)
+            self.assertFalse(matches('validate_mse_*', name), name)
+            self.assertFalse(matches('validate_*', name), name)
+
+        patterns = trainer_step_patterns([1, 5, 25])
+        for name in metrics:
+            self.assertTrue(
+                any(matches(pattern, name) for pattern in patterns), name
+            )
+
+        class _Run:
+            def __init__(self):
+                self.calls = []
+
+            def define_metric(self, name, step_metric=None, step_sync=None):
+                self.calls.append((name, step_metric, step_sync))
+
+        run = _Run()
+        defined = define_trainer_step_axis(
+            run,
+            cfg={'validate_extra': {'mse': {'horizons': [1, 5]}}},
+            metrics={'validate_mse_15/dark': 0.1, 'trainer/global_step': 4},
+        )
+        self.assertEqual(run.calls[0][0], 'trainer/global_step')
+        names = [name for name, _step, _sync in run.calls[1:]]
+        self.assertEqual(names, defined)
+        self.assertIn('fit/*', names)
+        self.assertIn('validate/*', names)
+        self.assertIn('validate_mse_1/*', names)
+        self.assertIn('validate_mse_15/*', names)
+        self.assertNotIn('validate_mse_*', names)
+        self.assertNotIn('*', names)
+        for name, step, sync in run.calls[1:]:
+            self.assertEqual(step, 'trainer/global_step', name)
+            self.assertIs(sync, False)
+        self.assertEqual(section_glob('fit/proprio_loss'), 'fit/*')
+        self.assertIsNone(section_glob('trainer/global_step'))
 
     def test_epoch_end_step_matches_the_validation_record(self):
         self.assertTrue(queue_this_epoch(1, 1))

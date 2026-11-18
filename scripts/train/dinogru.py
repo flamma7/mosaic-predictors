@@ -41,6 +41,7 @@ from dinowm import (
     _strip_action_dims,
     dinowm_forward,
     load_training_split,
+    log_stage_losses,
     make_wandb_logger,
 )
 from mosaic_predictors.dinogru import (
@@ -232,12 +233,7 @@ def dinogru_forward(self, batch, stage, cfg):
         self.model, output['emb'], memory, history, num_preds
     )
     output = _observation_loss(output, pred, tgt, self.model)
-    losses = {
-        f'{stage}/{key}': value.detach()
-        for key, value in output.items()
-        if 'loss' in key
-    }
-    self.log_dict(losses, on_step=True, sync_dist=True)
+    log_stage_losses(self, output, stage)
     return output
 
 

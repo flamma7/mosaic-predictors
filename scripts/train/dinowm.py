@@ -23,6 +23,7 @@ from validate_extra import (
 )
 from validation_queue import (
     ValidationQueue,
+    define_trainer_step_axis,
     logged_global_step,
     queue_this_epoch,
 )
@@ -172,7 +173,11 @@ def wandb_logger_config(cfg):
 def make_wandb_logger(cfg):
     if not cfg.wandb.enabled:
         return None
-    return WandbLogger(**wandb_logger_config(cfg))
+    logger = WandbLogger(**wandb_logger_config(cfg))
+    # After Lightning's ``*`` definition. That glob does not match slashes,
+    # so fit/*, validate/*, and validate_mse_<h>/* would otherwise use Step.
+    define_trainer_step_axis(logger.experiment, cfg)
+    return logger
 
 
 def _hf_path_prefix(hf_cfg, run_name):
@@ -403,6 +408,29 @@ def _embedding_from_cache(model, batch, cfg):
     return info
 
 
+def log_stage_losses(module, output, stage):
+    """Log ``{stage}/loss`` without a wandb row per validation batch.
+
+    Lightning logs ``on_step`` validation metrics at the val-batch index, and
+    each call is a new wandb history row. A full val loader is thousands of
+    rows that do not contain ``fit/loss``, so that chart interpolates across
+    the gap. Training stays on-step. Validation and test stay on-epoch, which
+    is one row at ``trainer/global_step``.
+    """
+    losses = {
+        f'{stage}/{key}': value.detach()
+        for key, value in output.items()
+        if 'loss' in key
+    }
+    training = stage in ('fit', 'train')
+    module.log_dict(
+        losses,
+        on_step=training,
+        on_epoch=not training,
+        sync_dist=True,
+    )
+
+
 def dinowm_forward(self, batch, stage, cfg):
     """Teacher-forced latent MSE on frozen DINOv2 features.
 
@@ -450,12 +478,7 @@ def dinowm_forward(self, batch, stage, cfg):
     if output['loss'].isnan():
         raise ValueError('NaN loss encountered')
 
-    losses_dict = {
-        f'{stage}/{k}': v.detach()
-        for k, v in output.items()
-        if 'loss' in k
-    }
-    self.log_dict(losses_dict, on_step=True, sync_dist=True)
+    log_stage_losses(self, output, stage)
     return output
 
 

@@ -22,6 +22,8 @@ COLUMNS = (
     'model_name',
     'checkpoint_name',
     'wandb_id',
+    # Lightning's ``trainer/global_step`` for this epoch. W&B charts use
+    # this same integer as their x-axis.
     'global_step',
     'started',
     'machine_job_id',
@@ -82,6 +84,78 @@ def extra_validation_log(metrics, global_step, epoch):
     payload['trainer/global_step'] = step
     payload['epoch'] = epoch
     return payload
+
+
+def mse_horizons(cfg):
+    """Horizons from ``validate_extra.mse.horizons``, or none."""
+    if cfg is None or not hasattr(cfg, 'get'):
+        return []
+    extra = cfg.get('validate_extra')
+    if extra is None or not hasattr(extra, 'get'):
+        return []
+    mse = extra.get('mse')
+    if mse is None or not hasattr(mse, 'get'):
+        return []
+    horizons = mse.get('horizons') or []
+    return [int(horizon) for horizon in horizons]
+
+
+def trainer_step_patterns(horizons):
+    """W&B globs that must use Lightning's ``trainer/global_step``.
+
+    A ``*`` pattern does not match ``/``. Lightning's default ``*`` therefore
+    leaves ``fit/loss``, ``validate/loss``, and ``validate_mse_<h>/<name>``
+    on the internal Step axis. ``validate_mpc/*`` was the one pattern that
+    already included the slash.
+    """
+    patterns = ['fit/*', 'validate/*', 'hparams/*', 'validate_mpc/*']
+    seen = set(patterns)
+    for horizon in horizons:
+        pattern = f'validate_mse_{int(horizon)}/*'
+        if pattern not in seen:
+            seen.add(pattern)
+            patterns.append(pattern)
+    return patterns
+
+
+def section_glob(metric_name):
+    """``validate_mse_5/none`` -> ``validate_mse_5/*``.
+
+    The star stays in the last path segment. ``fit/loss`` -> ``fit/*``.
+    """
+    name = str(metric_name)
+    if '/' not in name or name in ('trainer/global_step',):
+        return None
+    prefix, _slash, _leaf = name.rpartition('/')
+    if not prefix or prefix == 'trainer':
+        return None
+    return f'{prefix}/*'
+
+
+def define_trainer_step_axis(run, cfg=None, metrics=None, step_sync=False):
+    """Plot training and extra-validation metrics against ``trainer/global_step``.
+
+    ``step_sync`` stays off. The step is written in the same record, and a
+    validation server logs that record after training has moved past it.
+    """
+    define = getattr(run, 'define_metric', None)
+    if not callable(define):
+        return []
+    define('trainer/global_step')
+    patterns = trainer_step_patterns(mse_horizons(cfg))
+    seen = set(patterns)
+    for name in metrics or ():
+        pattern = section_glob(name)
+        if pattern and pattern not in seen:
+            seen.add(pattern)
+            patterns.append(pattern)
+    for pattern in patterns:
+        define(
+            pattern,
+            step_metric='trainer/global_step',
+            step_sync=step_sync,
+        )
+    return patterns
 
 
 def _is_true(value):

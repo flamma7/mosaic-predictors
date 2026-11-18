@@ -123,8 +123,9 @@ class _Holder:
     def __init__(self, model):
         self.model = model
 
-    def log_dict(self, values, **_kwargs):
+    def log_dict(self, values, **kwargs):
         self.logs = values
+        self.log_kwargs = kwargs
 
 
 def _batch(frames, batch=2):
@@ -188,8 +189,30 @@ class DinoGRUTests(unittest.TestCase):
         self.assertTrue(torch.equal(out_l['loss'], out_r['loss']))
         self.assertTrue(torch.equal(out_l['pixels_loss'], out_r['pixels_loss']))
         self.assertEqual(set(hold_l.logs), set(hold_r.logs))
+        self.assertEqual(
+            hold_l.log_kwargs, dict(on_step=True, on_epoch=False, sync_dist=True)
+        )
+        self.assertEqual(hold_l.log_kwargs, hold_r.log_kwargs)
         self.assertIsNone(left.plan_history_len)
         self.assertFalse(getattr(left.predictor, '_memory_slots', False))
+
+    def test_validation_loss_is_logged_once_per_epoch(self):
+        train = _load_train()
+        model = make_model(gru=True)
+        batch = _batch(4)
+        cfg = _cfg(perturb=False)
+        fit = _Holder(model)
+        train.dinogru_forward(fit, copy.deepcopy(batch), 'fit', cfg)
+        self.assertIn('fit/loss', fit.logs)
+        self.assertEqual(
+            fit.log_kwargs, dict(on_step=True, on_epoch=False, sync_dist=True)
+        )
+        val = _Holder(model)
+        train.dinogru_forward(val, copy.deepcopy(batch), 'validate', cfg)
+        self.assertIn('validate/loss', val.logs)
+        self.assertEqual(
+            val.log_kwargs, dict(on_step=False, on_epoch=True, sync_dist=True)
+        )
 
     def test_short_window_matches_single_predict(self):
         model = make_model(gru=False)
