@@ -273,6 +273,37 @@ class ValidationQueueTests(unittest.TestCase):
         self.assertTrue(settings['x_update_finish_state'])
         self.assertEqual(settings['x_label'], 'train')
 
+    def test_remote_training_assigns_a_wandb_id_when_hydra_left_it_empty(self):
+        from omegaconf import OmegaConf
+
+        from validate_extra import require_remote_extra
+
+        cfg = OmegaConf.create(
+            {
+                'output_model_name': 'dinogru',
+                'wandb': {
+                    'enabled': True,
+                    'config': {
+                        'id': None,
+                        'entity': 'lab',
+                        'project': 'jepa',
+                        'settings': {'mode': 'shared'},
+                    },
+                },
+                'hf': {'enabled': True, 'repo_id': 'lab/models'},
+                'validate_extra': {
+                    'enabled': True,
+                    'on_validation_server': True,
+                },
+            }
+        )
+        require_remote_extra(cfg)
+        wandb_id = str(cfg.wandb.config.id)
+        self.assertTrue(wandb_id.startswith('dinogru-'))
+        self.assertNotIn(' ', wandb_id)
+        require_remote_extra(cfg)
+        self.assertEqual(str(cfg.wandb.config.id), wandb_id)
+
 
 if __name__ == '__main__':
     unittest.main()

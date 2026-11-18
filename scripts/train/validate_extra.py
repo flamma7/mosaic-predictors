@@ -19,12 +19,15 @@ Train, val, MSE, and MPC all read the dataset named in the run config.
 from __future__ import annotations
 
 import importlib.util
+import re
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
 import torch
 from lightning.pytorch.callbacks import Callback
-from omegaconf import OmegaConf
+from omegaconf import OmegaConf, open_dict, read_write
 from sklearn.preprocessing import StandardScaler
 from torch.nn import functional as F
 
@@ -391,6 +394,39 @@ def extra_runs_locally(cfg):
     return not bool(extra.get('on_validation_server', False))
 
 
+_WANDB_ID_CHARS = re.compile(r'[^A-Za-z0-9_-]+')
+
+
+def _blank_id(value):
+    return value is None or str(value).strip() == ''
+
+
+def ensure_wandb_run_id(cfg):
+    """Fill ``wandb.config.id`` when a local Hydra job left it empty.
+
+    The launcher sets ``id: ${subdir}``, and ``subdir`` is ``hydra.job.id``.
+    A single local run never populates that field, so the interpolation is
+    null. The validation server resumes this exact id.
+    """
+    wandb_id = OmegaConf.select(cfg, 'wandb.config.id')
+    if not _blank_id(wandb_id):
+        return str(wandb_id)
+    if OmegaConf.select(cfg, 'wandb.config') is None:
+        raise RuntimeError(
+            'validate_extra.on_validation_server needs wandb.config '
+            'so a run id can be assigned.'
+        )
+    raw_name = str(OmegaConf.select(cfg, 'output_model_name') or 'run')
+    name = _WANDB_ID_CHARS.sub('-', raw_name).strip('-') or 'run'
+    stamp = datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')
+    wandb_id = f'{name}-{stamp}-{uuid.uuid4().hex[:8]}'
+    with read_write(cfg):
+        with open_dict(cfg):
+            cfg.wandb.config.id = wandb_id
+    print(f'[validate_extra] assigned wandb.config.id={wandb_id}')
+    return wandb_id
+
+
 def require_remote_extra(cfg):
     """Fail before training if a remote job could not be logged or downloaded."""
     if not extra_runs_on_server(cfg):
@@ -402,8 +438,8 @@ def require_remote_extra(cfg):
             'validate_extra.on_validation_server logs into the training '
             'W&B run, so wandb.enabled must be true.'
         )
-    wandb_id = OmegaConf.select(cfg, 'wandb.config.id')
-    if wandb_id is None or str(wandb_id) == '':
+    wandb_id = ensure_wandb_run_id(cfg)
+    if _blank_id(wandb_id):
         raise RuntimeError(
             'validate_extra.on_validation_server needs wandb.config.id '
             'so the validation server can resume that run.'

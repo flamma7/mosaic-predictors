@@ -13,6 +13,8 @@ wandb:
     entity: flamma7-myself
     project: jepa-perturb
     name: ${output_model_name}
+    # Copies hydra.job.id. A single local run leaves that unset; training
+    # then assigns an id so the validation server can resume the run.
     id: ${subdir}
     resume: allow
     log_model: False
