@@ -10,7 +10,16 @@ must have been opened with ``wandb.config.settings.mode=shared``.
 One process validates one checkpoint at a time. Give each machine its own
 ``--machine-job-id``. A write always re-reads ``validation.csv`` first.
 
-    python scripts/train/validate_server.py --machine-job-id val-0
+``--override`` changes ``validate_extra`` on the loaded ``config.yaml``
+for this process only. ``config.json`` stays the model config.
+
+    python scripts/train/validate_server.py --machine-job-id val-0 \
+        --override mse.num_samples=8 --override mpc.num_eval=4
+
+``mse.num_samples`` is how many validation clips the open-loop pass
+scores. ``mpc.num_eval`` is how many episodes MPC runs. Per episode,
+planning cost is mostly ``mpc.num_samples`` times ``mpc.n_steps``, and
+each enabled perturbation repeats both passes.
 """
 
 from __future__ import annotations
@@ -27,6 +36,7 @@ import traceback
 
 import torch
 from omegaconf import OmegaConf
+from omegaconf.errors import OmegaConfBaseException
 
 from dinogru import apply_cfg_start_stride
 from dinowm import load_training_split
@@ -119,7 +129,100 @@ def _global_step(job):
     return step
 
 
-def run_job(repo_id, job):
+def _split_override(item):
+    """``mse.num_samples=8`` or ``validate_extra.mse.num_samples=8``."""
+    text = str(item).strip()
+    if '=' not in text:
+        raise ValueError(f'override must be key=value, got {item!r}')
+    key, value = text.split('=', 1)
+    key = key.strip()
+    if key.startswith('validate_extra.'):
+        key = key[len('validate_extra.') :]
+    if not key or key.startswith('.') or key.endswith('.') or '..' in key:
+        raise ValueError(f'override key is empty: {item!r}')
+    return key, value
+
+
+def _require_extra_key(extra, key):
+    """Return the node at ``key``. Raise when any path segment is absent.
+
+    ``OmegaConf.select(..., throw_on_missing=True)`` only rejects ``???``
+    values. A typo would otherwise be inserted as a new field and ignored
+    by the callback.
+    """
+    node = extra
+    for part in key.split('.'):
+        if not OmegaConf.is_config(node) or part not in node:
+            raise ValueError(f'validate_extra has no {key}')
+        node = node[part]
+    return node
+
+
+def apply_validate_extra_overrides(cfg, overrides):
+    """Merge ``key=value`` pairs into ``cfg.validate_extra``.
+
+    Keys are relative to ``validate_extra``. A ``validate_extra.`` prefix
+    is also accepted. Unknown keys raise, so a typo cannot leave the
+    checkpoint config unchanged. The returned config is a new object.
+    """
+    if not overrides:
+        return cfg
+    extra = cfg.get('validate_extra')
+    if extra is None:
+        raise ValueError('config has no validate_extra to override')
+    parsed = [_split_override(item) for item in overrides]
+    for key, _value in parsed:
+        _require_extra_key(extra, key)
+    dotted = [f'validate_extra.{key}={value}' for key, value in parsed]
+    try:
+        patch = OmegaConf.from_dotlist(dotted)
+    except OmegaConfBaseException as exc:
+        raise ValueError(f'could not parse overrides: {exc}') from exc
+    merged = OmegaConf.merge(cfg, patch)
+    seen = []
+    for key, _value in parsed:
+        if key in seen:
+            continue
+        seen.append(key)
+        before = OmegaConf.select(extra, key)
+        after = OmegaConf.select(merged.validate_extra, key)
+        print(
+            f'[validate_server] override validate_extra.{key}: '
+            f'{before} -> {after}',
+            flush=True,
+        )
+    return merged
+
+
+def log_extra_budget(cfg):
+    """Print the fields that scale MSE and MPC wall time."""
+    extra = cfg.validate_extra
+    mse = extra.get('mse') or {}
+    mpc = extra.get('mpc') or {}
+    names = []
+    for name in extra.get('perturbations') or {}:
+        spec = extra.perturbations[name]
+        if spec is None or not bool(spec.get('enabled', True)):
+            continue
+        names.append(str(name))
+    samples = mse.get('num_samples')
+    sample_text = 'all' if samples is None else samples
+    print(
+        '[validate_server] '
+        f'mse num_samples={sample_text} '
+        f'pred_length={mse.get("pred_length")} '
+        f'enabled={bool(mse.get("enabled", True))}; '
+        f'mpc num_eval={mpc.get("num_eval")} '
+        f'num_samples={mpc.get("num_samples")} '
+        f'n_steps={mpc.get("n_steps")} '
+        f'eval_budget={mpc.get("eval_budget")} '
+        f'enabled={bool(mpc.get("enabled", True))}; '
+        f'perturbations={",".join(names) or "(none)"}',
+        flush=True,
+    )
+
+
+def run_job(repo_id, job, overrides=()):
     """Download one checkpoint and run its config's extra validation."""
     model_name = job['model_name']
     checkpoint_name = job['checkpoint_name']
@@ -132,6 +235,8 @@ def run_job(repo_id, job):
     cfg = OmegaConf.load(model_dir / 'config.yaml')
     if cfg.get('validate_extra') is None:
         raise RuntimeError(f'{model_name}/config.yaml has no validate_extra')
+    cfg = apply_validate_extra_overrides(cfg, overrides)
+    log_extra_budget(cfg)
 
     from stable_worldmodel.wm.utils import load_pretrained
 
@@ -180,7 +285,7 @@ def run_job(repo_id, job):
     )
 
 
-def poll(machine_job_id, repo_id, poll_seconds, once, revision):
+def poll(machine_job_id, repo_id, poll_seconds, once, revision, overrides):
     queue = ValidationQueue(repo_id, revision=revision)
     while True:
         job = queue.claim(machine_job_id)
@@ -197,7 +302,7 @@ def poll(machine_job_id, repo_id, poll_seconds, once, revision):
             flush=True,
         )
         try:
-            run_job(repo_id, job)
+            run_job(repo_id, job, overrides)
             queue.complete(job, machine_job_id)
             print(
                 '[validate_server] completed '
@@ -235,15 +340,33 @@ def main():
         action='store_true',
         help='Claim and run at most one job, then exit.',
     )
+    parser.add_argument(
+        '--override',
+        action='append',
+        default=[],
+        metavar='KEY=VALUE',
+        help=(
+            'Override one validate_extra field from the checkpoint '
+            'config.yaml. Repeatable. Keys are relative to validate_extra, '
+            'for example mse.num_samples=8 or mpc.num_eval=4. '
+            'mpc.num_samples and mpc.n_steps scale the CEM loop.'
+        ),
+    )
     args = parser.parse_args()
     if args.poll_seconds < 0:
         raise SystemExit('--poll-seconds must be >= 0')
+    try:
+        for item in args.override:
+            _split_override(item)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from None
     poll(
         machine_job_id=args.machine_job_id,
         repo_id=args.repo_id,
         poll_seconds=args.poll_seconds,
         once=args.once,
         revision=args.revision,
+        overrides=args.override,
     )
 
 
