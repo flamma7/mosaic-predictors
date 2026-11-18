@@ -419,7 +419,7 @@ def run(cfg):
     if _scale_needed(cfg):
         world_model = world_model.to(device)
     s_r = _resolve_s_r(
-        world_model, train_set, cfg, device, ckpt_path, run_dir
+        world_model, split.train_set, cfg, device, ckpt_path, run_dir
     )
     if s_r is not None:
         with open_dict(cfg):

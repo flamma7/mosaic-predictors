@@ -123,7 +123,7 @@ wm:
 # wandb.config.settings.mode must be shared.
 validate_extra:
   enabled: true
-  on_validation_server: false
+  on_validation_server: true
   every_n_epochs: 1
   mse:
     enabled: true
@@ -135,7 +135,7 @@ validate_extra:
     num_samples: 64
   mpc:
     enabled: true
-    num_eval: 25
+    num_eval: 50
     seed: ${seed}
     goal_offset_steps: 25
     eval_budget: 50
