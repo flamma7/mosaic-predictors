@@ -75,7 +75,7 @@ wm:
 # wandb.config.settings.mode must be shared.
 validate_extra:
   enabled: true
-  on_validation_server: false
+  on_validation_server: true
   every_n_epochs: 1
   mse:
     enabled: true
